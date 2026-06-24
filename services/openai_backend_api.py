@@ -21,7 +21,7 @@ from PIL import Image
 
 from services.account_service import account_service
 from services.config import config
-from services.proxy_service import proxy_settings
+from services.personal_account_service import personal_account_service
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
@@ -167,11 +167,10 @@ class OpenAIBackendAPI:
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
-        self.session = requests.Session(**proxy_settings.build_session_kwargs(
-            account=self.account,
+        self.session = requests.Session(
             impersonate=self.fp["impersonate"],
             verify=True,
-        ))
+        )
         self.session.headers.update({
             "User-Agent": self.user_agent,
             "Origin": self.base_url,
