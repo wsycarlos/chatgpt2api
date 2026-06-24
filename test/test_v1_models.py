@@ -9,12 +9,15 @@ import requests
 from services.protocol import openai_v1_models
 
 
+from services.personal_account_service import personal_account_service
+
+
 AUTH_KEY = "chatgpt2api"
 BASE_URL = "http://localhost:8000"
 
 
 class ModelListTests(unittest.TestCase):
-    def test_list_models_only_returns_image_models_backed_by_account_types(self):
+    def test_list_models_returns_exposed_models_when_accounts_exist(self):
         with (
             mock.patch.object(
                 openai_v1_models.OpenAIBackendAPI,
@@ -22,12 +25,10 @@ class ModelListTests(unittest.TestCase):
                 return_value={"object": "list", "data": []},
             ),
             mock.patch.object(
-                openai_v1_models.account_service,
+                personal_account_service,
                 "list_accounts",
                 return_value=[
                     {"access_token": "token-free", "type": "free"},
-                    {"access_token": "token-web-team", "type": "Team", "source_type": "web"},
-                    {"access_token": "token-codex-team", "type": "Team", "source_type": "codex"},
                 ],
             ),
         ):
@@ -36,31 +37,27 @@ class ModelListTests(unittest.TestCase):
         ids = {item["id"] for item in result["data"]}
         self.assertIn("gpt-image-2", ids)
         self.assertIn("codex-gpt-image-2", ids)
-        self.assertIn("team-codex-gpt-image-2", ids)
-        self.assertNotIn("plus-codex-gpt-image-2", ids)
-        self.assertNotIn("pro-codex-gpt-image-2", ids)
+        self.assertIn("auto", ids)
+        self.assertIn("gpt-5", ids)
 
-    def test_list_models_does_not_return_codex_models_for_web_plus_accounts(self):
+    def test_list_models_returns_upstream_models_when_no_accounts_exist(self):
         with (
             mock.patch.object(
                 openai_v1_models.OpenAIBackendAPI,
                 "list_models",
-                return_value={"object": "list", "data": []},
+                return_value={"object": "list", "data": [{"id": "upstream-model", "object": "model"}]},
             ),
             mock.patch.object(
-                openai_v1_models.account_service,
+                personal_account_service,
                 "list_accounts",
-                return_value=[
-                    {"access_token": "token-web-plus", "type": "Plus", "source_type": "web"},
-                ],
+                return_value=[],
             ),
         ):
             result = openai_v1_models.list_models()
 
         ids = {item["id"] for item in result["data"]}
-        self.assertIn("gpt-image-2", ids)
+        self.assertIn("upstream-model", ids)
         self.assertNotIn("codex-gpt-image-2", ids)
-        self.assertNotIn("plus-codex-gpt-image-2", ids)
 
     def test_list_models_function(self):
         """测试直接调用服务层获取模型列表。"""

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import requests
 
-from test.utils import save_image
+from test.test_helpers import save_image
 from utils.log import logger
 
 AUTH_KEY = "chatgpt2api"
