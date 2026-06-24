@@ -19,9 +19,8 @@ from urllib.parse import unquote, urlparse
 from curl_cffi import requests
 from PIL import Image
 
-from services.account_service import account_service
 from services.config import config
-from services.personal_account_service import personal_account_service
+from services.personal_account_service import _decode_jwt_payload, personal_account_service
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
@@ -158,7 +157,7 @@ class OpenAIBackendAPI:
         self.client_version = DEFAULT_CLIENT_VERSION
         self.client_build_number = DEFAULT_CLIENT_BUILD_NUMBER
         self.access_token = access_token
-        self.account = account_service.get_account(self.access_token) if self.access_token else {}
+        self.account = personal_account_service.get_default_account() or {}
         self.account = self.account if isinstance(self.account, dict) else {}
         self.fp = self._build_fp()
         self.user_agent = self.fp["user-agent"]
@@ -540,7 +539,7 @@ class OpenAIBackendAPI:
         }
 
     def _ensure_codex_source_account(self) -> None:
-        account = account_service.get_account(self.access_token)
+        account = personal_account_service.get_default_account()
         source_type = str((account or {}).get("source_type") or "web").strip().lower()
         if source_type != "codex":
             raise RuntimeError("codex responses endpoint requires a codex source account")
@@ -745,8 +744,8 @@ class OpenAIBackendAPI:
             self._codex_responses_headers(),
             method="POST",
         )
-        account = account_service.get_account(self.access_token) or {}
-        token_payload = account_service._decode_jwt_payload(self.access_token)
+        account = personal_account_service.get_default_account() or {}
+        token_payload = _decode_jwt_payload(self.access_token)
         auth_claim = token_payload.get("https://api.openai.com/auth")
         auth_claim = auth_claim if isinstance(auth_claim, dict) else {}
         tool = payload["tools"][0]
