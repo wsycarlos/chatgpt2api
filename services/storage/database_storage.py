@@ -30,6 +30,14 @@ class AuthKeyModel(Base):
     data = Column(Text, nullable=False)
 
 
+class PersonalAccountModel(Base):
+    """个人账号数据模型（整表存储一个 JSON 列表）"""
+    __tablename__ = "personal_accounts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    data = Column(Text, nullable=False)
+
+
 class DatabaseStorageBackend(StorageBackend):
     """数据库存储后端（支持 SQLite、PostgreSQL、MySQL 等）"""
 
@@ -70,6 +78,38 @@ class DatabaseStorageBackend(StorageBackend):
     def save_auth_keys(self, auth_keys: list[dict[str, Any]]) -> None:
         """保存鉴权密钥数据到数据库"""
         self._save_rows(AuthKeyModel, auth_keys, "id", "key_id")
+
+    def load_personal_accounts(self) -> list[dict[str, object]]:
+        """从数据库加载个人账号数据"""
+        session = self.Session()
+        try:
+            row = session.query(PersonalAccountModel).first()
+            if not row:
+                return []
+            try:
+                data = json.loads(row.data)
+                return data if isinstance(data, list) else []
+            except json.JSONDecodeError:
+                return []
+        finally:
+            session.close()
+
+    def save_personal_accounts(self, accounts: list[dict[str, object]]) -> None:
+        """保存个人账号数据到数据库"""
+        session = self.Session()
+        try:
+            session.query(PersonalAccountModel).delete()
+            session.add(
+                PersonalAccountModel(
+                    data=json.dumps(accounts, ensure_ascii=False),
+                )
+            )
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            raise e
+        finally:
+            session.close()
 
     def _load_rows(self, model: type[AccountModel] | type[AuthKeyModel]) -> list[dict[str, Any]]:
         session = self.Session()
@@ -124,12 +164,14 @@ class DatabaseStorageBackend(StorageBackend):
                 session.execute(text("SELECT 1"))
                 count = session.query(AccountModel).count()
                 auth_key_count = session.query(AuthKeyModel).count()
+                personal_account_count = session.query(PersonalAccountModel).count()
                 return {
                     "status": "healthy",
                     "backend": "database",
                     "database_url": self._mask_password(self.database_url),
                     "account_count": count,
                     "auth_key_count": auth_key_count,
+                    "personal_account_count": personal_account_count,
                 }
             finally:
                 session.close()
