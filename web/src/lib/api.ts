@@ -228,22 +228,6 @@ export async function setDefaultAccount(id: string) {
   });
 }
 
-export type ProxyTestResult = {
-  ok: boolean;
-  status: number;
-  latency_ms: number;
-  error: string | null;
-  proxy_source?: string;
-  has_proxy?: boolean;
-};
-
-export async function testProxy(url?: string) {
-  return httpRequest<{ result: ProxyTestResult }>("/api/proxy/test", {
-    method: "POST",
-    body: { url: url ?? "" },
-  });
-}
-
 export async function generateImage(prompt: string, model?: ImageModel, size?: string, quality = "auto") {
   return httpRequest<ImageResponse>(
     "/v1/images/generations",
