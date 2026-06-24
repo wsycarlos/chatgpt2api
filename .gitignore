@@ -32,4 +32,4 @@ git_cache/
 # 调试/测试输出目录
 loginwithpassword_*/
 logwithemailverifycode_*/
-test_batch_output/
+test_batch_output/.worktrees/
