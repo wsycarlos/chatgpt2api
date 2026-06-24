@@ -29,8 +29,13 @@ def create_storage_backend(data_dir: Path) -> StorageBackend:
         # 本地 JSON 文件存储
         file_path = data_dir / "accounts.json"
         auth_keys_path = data_dir / "auth_keys.json"
+        personal_accounts_path = data_dir / "personal_accounts.json"
         print(f"[storage] Using JSON storage: {file_path}")
-        return JSONStorageBackend(file_path, auth_keys_path)
+        return JSONStorageBackend(
+            file_path,
+            auth_keys_path=auth_keys_path,
+            personal_accounts_path=personal_accounts_path,
+        )
     
     elif backend_type in ("sqlite", "postgres", "postgresql", "mysql", "database"):
         # 数据库存储
@@ -52,6 +57,7 @@ def create_storage_backend(data_dir: Path) -> StorageBackend:
         branch = os.getenv("GIT_BRANCH", "main").strip()
         file_path = os.getenv("GIT_FILE_PATH", "accounts.json").strip()
         auth_keys_file_path = os.getenv("GIT_AUTH_KEYS_FILE_PATH", "auth_keys.json").strip()
+        personal_accounts_file_path = os.getenv("GIT_PERSONAL_ACCOUNTS_FILE_PATH", "personal_accounts.json").strip()
         
         if not repo_url:
             raise ValueError(
@@ -68,6 +74,7 @@ def create_storage_backend(data_dir: Path) -> StorageBackend:
             branch=branch,
             file_path=file_path,
             auth_keys_file_path=auth_keys_file_path,
+            personal_accounts_file_path=personal_accounts_file_path,
             local_cache_dir=cache_dir,
         )
     

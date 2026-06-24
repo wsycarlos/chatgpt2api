@@ -30,6 +30,14 @@ class AuthKeyModel(Base):
     data = Column(Text, nullable=False)
 
 
+class PersonalAccountModel(Base):
+    """个人账号数据模型"""
+    __tablename__ = "personal_accounts"
+
+    id = Column(String(255), primary_key=True, unique=True, nullable=False, index=True)
+    data = Column(Text, nullable=False)
+
+
 class DatabaseStorageBackend(StorageBackend):
     """数据库存储后端（支持 SQLite、PostgreSQL、MySQL 等）"""
 
@@ -71,7 +79,18 @@ class DatabaseStorageBackend(StorageBackend):
         """保存鉴权密钥数据到数据库"""
         self._save_rows(AuthKeyModel, auth_keys, "id", "key_id")
 
-    def _load_rows(self, model: type[AccountModel] | type[AuthKeyModel]) -> list[dict[str, Any]]:
+    def load_personal_accounts(self) -> list[dict[str, Any]]:
+        """从数据库加载个人账号数据"""
+        return self._load_rows(PersonalAccountModel)
+
+    def save_personal_accounts(self, accounts: list[dict[str, Any]]) -> None:
+        """保存个人账号数据到数据库"""
+        self._save_rows(PersonalAccountModel, accounts, "id")
+
+    def _load_rows(
+        self,
+        model: type[AccountModel] | type[AuthKeyModel] | type[PersonalAccountModel],
+    ) -> list[dict[str, Any]]:
         session = self.Session()
         try:
             items = []
@@ -88,7 +107,7 @@ class DatabaseStorageBackend(StorageBackend):
 
     def _save_rows(
         self,
-        model: type[AccountModel] | type[AuthKeyModel],
+        model: type[AccountModel] | type[AuthKeyModel] | type[PersonalAccountModel],
         items: list[dict[str, Any]],
         source_key: str,
         target_key: str | None = None,
@@ -124,12 +143,14 @@ class DatabaseStorageBackend(StorageBackend):
                 session.execute(text("SELECT 1"))
                 count = session.query(AccountModel).count()
                 auth_key_count = session.query(AuthKeyModel).count()
+                personal_account_count = session.query(PersonalAccountModel).count()
                 return {
                     "status": "healthy",
                     "backend": "database",
                     "database_url": self._mask_password(self.database_url),
                     "account_count": count,
                     "auth_key_count": auth_key_count,
+                    "personal_account_count": personal_account_count,
                 }
             finally:
                 session.close()
