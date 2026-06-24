@@ -8,11 +8,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from services.account_service import account_service
 from services.config import DATA_DIR
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.openai_backend_api import EDITABLE_FILE_MODEL, OpenAIBackendAPI
+from services.personal_account_service import personal_account_service
 from utils.helper import new_uuid
 
 TASK_STATUS_QUEUED = "queued"
@@ -54,17 +54,14 @@ def _file_url(path: Path, base_url: str) -> str:
 
 
 def _editable_access_token() -> str:
-    accounts = [
-        item for item in account_service.list_accounts()
-        if _clean(item.get("access_token"))
-           and item.get("status") not in {"禁用", "异常"}
-           and account_service._account_matches_any_plan_type(item, EDITABLE_FILE_PLAN_TYPES)
-    ]
-    if not accounts:
-        raise RuntimeError("no available plus/team/pro account")
-    accounts.sort(key=lambda item: _clean(item.get("last_used_at")))
-    token = _clean(accounts[0].get("access_token"))
-    return account_service.refresh_access_token(token, event="editable_file_task") or token
+    account = personal_account_service.get_default_account()
+    if account is None:
+        raise RuntimeError("No ChatGPT account configured")
+    token = _clean(account.get("access_token"))
+    if not token:
+        raise RuntimeError("No ChatGPT account configured")
+    refreshed = personal_account_service.refresh_access_token(account["id"])
+    return _clean((refreshed or account).get("access_token")) or token
 
 
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
@@ -135,12 +132,11 @@ class EditableFileTaskService:
             if kind == "psd" and not base64_images:
                 raise ValueError("base64_images is empty")
             token = _editable_access_token()
-            account = account_service.get_account(token) or {}
+            account = personal_account_service.get_default_account() or {}
             account_email = _clean(account.get("email"))
             backend = OpenAIBackendAPI(token)
             output_dir = EDITABLE_FILE_ROOT / kind / key.rsplit(":", 1)[-1]
             result = backend.export_psd_zip(base64_images, prompt, output_dir) if kind == "psd" else backend.export_ppt_zip(base64_images, prompt, output_dir)
-            account_service.mark_text_used(token)
             data = {"conversation_id": result.conversation_id, "primary_url": _file_url(result.primary_path, base_url), "zip_url": _file_url(result.zip_path, base_url)}
             self._update_task(key, status=TASK_STATUS_SUCCESS, result=data, account_email=account_email, error="", ended_ts=time.time())
             self._log_call(identity, kind, started, request_text(prompt), account_email=account_email, result=data)
