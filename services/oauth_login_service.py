@@ -21,8 +21,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 from curl_cffi import requests
 
-from services.proxy_service import proxy_settings
-from services.register.openai_register import (
+from services.openai_auth_constants import (
     auth_base,
     common_headers,
     platform_auth0_client,
@@ -193,8 +192,7 @@ class OAuthLoginService:
     @staticmethod
     def _exchange_code(code: str, code_verifier: str, redirect_uri: str) -> dict[str, str]:
         """调用 /api/accounts/oauth/token 用 code+verifier 换 token 三件套。"""
-        kwargs = proxy_settings.build_session_kwargs(impersonate="chrome", verify=False)
-        session = requests.Session(**kwargs)
+        session = requests.Session(**{"impersonate": "chrome", "verify": False})
         try:
             response = session.post(
                 f"{auth_base}/api/accounts/oauth/token",
