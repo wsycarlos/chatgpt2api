@@ -1225,12 +1225,41 @@ def _generate_single_image(
     account = personal_account_service.get_default_account()
     if account is None:
         raise ImageGenerationError("No ChatGPT account configured")
+    first_account_id = str(account.get("id") or "")
+    tried_account_ids: set[str] = set()
     account_email = str(account.get("email") or "").strip()
     token = account["access_token"]
+
+    def failover_to_next_account(error_text: str) -> bool:
+        nonlocal account, account_email, token
+        if account is None:
+            return False
+        next_account = personal_account_service.switch_active_account(str(account.get("id") or ""))
+        if next_account is None:
+            if first_account_id:
+                personal_account_service.restore_active_account(first_account_id)
+            return False
+        next_account_id = str(next_account.get("id") or "")
+        if next_account_id not in tried_account_ids:
+            logger.warning({
+                "event": "image_stream_account_failover",
+                "failed_account_email": account_email,
+                "next_account_email": str(next_account.get("email") or "").strip(),
+                "index": index,
+                "error": error_text[:200],
+            })
+            account = next_account
+            account_email = str(account.get("email") or "").strip()
+            token = account["access_token"]
+            return True
+        if first_account_id:
+            personal_account_service.restore_active_account(first_account_id)
+        return False
 
     while True:
         if request.progress_callback:
             request.progress_callback("getting_account")
+        emitted_for_token = False
         logger.debug({
             "event": "image_account_lookup",
             "token_prefix": token[:12] + "..." if len(token) > 12 else token,
@@ -1239,12 +1268,14 @@ def _generate_single_image(
             "index": index,
         })
         try:
+            account_id = str(account.get("id") or "")
+            if account_id:
+                tried_account_ids.add(account_id)
             backend = OpenAIBackendAPI(access_token=token)
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
             outputs: list[ImageOutput] = []
-            emitted_for_token = False
             returned_message = False
             returned_result = False
             for output in stream_fn(backend, request, index, total):
@@ -1300,9 +1331,12 @@ def _generate_single_image(
                     "retry_count": poll_timeout_retry_count,
                     "index": index,
                 })
-                raise
+            if failover_to_next_account(str(exc)):
+                continue
             raise
         except ImageContentPolicyError as exc:
+            if failover_to_next_account(str(exc)):
+                continue
             logger.warning({
                 "event": "image_stream_content_policy_error",
                 "request_token": token,
@@ -1350,6 +1384,8 @@ def _generate_single_image(
                     account_email=account_email,
                     conversation_id=getattr(exc, "conversation_id", ""),
                 ) from exc
+            if failover_to_next_account(error_text):
+                continue
             logger.warning({
                 "event": "image_stream_generation_error",
                 "request_token": token,
@@ -1372,6 +1408,8 @@ def _generate_single_image(
                 if refreshed:
                     token = refreshed["access_token"]
                     account = refreshed
+                    continue
+                if failover_to_next_account(last_error):
                     continue
                 raise ImageGenerationError("ChatGPT token invalid", account_email=account_email, conversation_id="") from exc
             if not emitted_for_token and is_tls_connection_error(last_error):
@@ -1402,6 +1440,8 @@ def _generate_single_image(
                     })
                     time.sleep(wait_secs)
                     continue
+            if failover_to_next_account(last_error):
+                continue
             raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
 
 

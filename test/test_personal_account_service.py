@@ -49,6 +49,35 @@ class TestPersonalAccountService(unittest.TestCase):
     def test_get_active_access_token_with_no_account(self):
         self.assertEqual(self.service.get_active_access_token(), "")
 
+    def test_switch_active_account_moves_to_next_account(self):
+        first = self.service.add_account({"access_token": "t1", "email": "a@example.com"})
+        second = self.service.add_account({"access_token": "t2", "email": "b@example.com"})
+
+        active = self.service.switch_active_account(first["id"])
+
+        self.assertEqual(active["id"], second["id"])
+        self.assertEqual(self.service.get_default_account()["id"], second["id"])
+
+    def test_switch_active_account_wraps_to_first_account(self):
+        first = self.service.add_account({"access_token": "t1", "email": "a@example.com"})
+        second = self.service.add_account({"access_token": "t2", "email": "b@example.com"})
+        self.service.set_default(second["id"])
+
+        active = self.service.switch_active_account(second["id"])
+
+        self.assertEqual(active["id"], first["id"])
+        self.assertEqual(self.service.get_default_account()["id"], first["id"])
+
+    def test_restore_active_account_switches_back_to_first_attempt(self):
+        first = self.service.add_account({"access_token": "t1", "email": "a@example.com"})
+        second = self.service.add_account({"access_token": "t2", "email": "b@example.com"})
+        self.service.set_default(second["id"])
+
+        restored = self.service.restore_active_account(first["id"])
+
+        self.assertEqual(restored["id"], first["id"])
+        self.assertEqual(self.service.get_default_account()["id"], first["id"])
+
     @mock.patch("services.personal_account_service.requests.Session")
     def test_refresh_access_token(self, mock_session_cls):
         account = self.service.add_account({

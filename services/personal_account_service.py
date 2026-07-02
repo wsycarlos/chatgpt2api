@@ -115,6 +115,23 @@ class PersonalAccountService:
                 return dict(account)
         return dict(accounts[0])
 
+    def switch_active_account(self, current_account_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            if not self._accounts:
+                return None
+            current_index = next(
+                (index for index, account in enumerate(self._accounts) if account.get("id") == current_account_id),
+                -1,
+            )
+            next_index = (current_index + 1) % len(self._accounts) if current_index >= 0 else 0
+            for index, account in enumerate(self._accounts):
+                account["is_default"] = index == next_index
+            self._save()
+            return dict(self._accounts[next_index])
+
+    def restore_active_account(self, account_id: str) -> dict[str, Any] | None:
+        return self.set_default(account_id)
+
     def set_default(self, account_id: str) -> dict[str, Any] | None:
         with self._lock:
             found = None
