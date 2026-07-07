@@ -89,11 +89,17 @@ class PersonalAccountService:
         email = str(item.get("email") or id_claims.get("email") or "").strip() or None
         account_id = str(item.get("account_id") or auth_claims.get("chatgpt_account_id") or "").strip() or None
         account_type = str(item.get("type") or auth_claims.get("chatgpt_plan_type") or "").strip() or None
+        source_type = str(item.get("source_type") or "").strip() or None
+        export_type = str(item.get("export_type") or "").strip() or None
+        name = str(item.get("name") or "").strip() or None
         return {
             "id": str(item.get("id") or uuid.uuid4().hex[:12]),
+            "name": name,
             "email": email,
             "account_id": account_id,
             "type": account_type,
+            "source_type": source_type,
+            "export_type": export_type,
             "access_token": access_token,
             "refresh_token": str(item.get("refresh_token") or "").strip() or None,
             "id_token": id_token,

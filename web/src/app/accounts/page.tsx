@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { CheckCircle2, Copy, ExternalLink, LoaderCircle, RefreshCw, Star, Trash2, Upload } from "lucide-react";
+import { CheckCircle2, Copy, ExternalLink, FileJson, LoaderCircle, RefreshCw, Star, Trash2, Upload } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -25,6 +25,7 @@ import {
   setDefaultAccount,
   startOAuthLogin,
   type Account,
+  type AccountImportPayload,
   type OAuthLoginStartResponse,
 } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
@@ -54,6 +55,69 @@ function splitTokens(value: string) {
     .split(/\r?\n/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function accountSourceLabel(account: Account) {
+  const source = String(account.source_type || "").toLowerCase();
+  if (source === "codex") return "Codex";
+  if (source === "oauth_login") return "Personal OAuth";
+  return "Manual";
+}
+
+function accountSourceClassName(account: Account) {
+  const source = String(account.source_type || "").toLowerCase();
+  if (source === "codex") return "border-violet-200 bg-violet-50 text-violet-700";
+  if (source === "oauth_login") return "border-sky-200 bg-sky-50 text-sky-700";
+  return "border-stone-200 bg-stone-50 text-stone-600";
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function cleanString(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function candidateSub2ApiAccounts(value: unknown): Record<string, unknown>[] {
+  if (Array.isArray(value)) {
+    return value.flatMap(candidateSub2ApiAccounts);
+  }
+  const record = asRecord(value);
+  if (!record) return [];
+  for (const key of ["accounts", "items", "data"]) {
+    if (Array.isArray(record[key])) {
+      return candidateSub2ApiAccounts(record[key]);
+    }
+  }
+  return [record];
+}
+
+function sub2ApiAccountPayload(value: unknown): AccountImportPayload | null {
+  const account = asRecord(value);
+  if (!account) return null;
+  const credentials = asRecord(account.credentials) ?? account;
+  const accessToken = cleanString(credentials.access_token ?? credentials.accessToken);
+  if (!accessToken) return null;
+
+  const email = cleanString(credentials.email ?? account.email ?? asRecord(account.extra)?.email);
+  const accountId = cleanString(credentials.chatgpt_account_id ?? credentials.account_id ?? account.account_id);
+  const planType = cleanString(credentials.plan_type ?? account.plan_type ?? account.type);
+  return {
+    access_token: accessToken,
+    refresh_token: cleanString(credentials.refresh_token),
+    id_token: cleanString(credentials.id_token),
+    email: email || undefined,
+    account_id: accountId || undefined,
+    type: planType || undefined,
+    name: cleanString(account.name) || undefined,
+    source_type: "codex",
+    export_type: "codex",
+  };
+}
+
+async function readJsonFile(file: File) {
+  return JSON.parse(await file.text()) as unknown;
 }
 
 function useAccounts() {
@@ -352,12 +416,104 @@ function ImportTokenDialog({
   );
 }
 
+function ImportSub2ApiDialog({
+  open,
+  onOpenChange,
+  onImported,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onImported: (items: Account[]) => void;
+}) {
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  const handleOpenChange = (next: boolean) => {
+    onOpenChange(next);
+    if (!next) setSubmitting(false);
+  };
+
+  const handleFiles = async (files: FileList | null) => {
+    const selected = Array.from(files ?? []);
+    if (inputRef.current) inputRef.current.value = "";
+    if (selected.length === 0) return;
+
+    setSubmitting(true);
+    try {
+      const parsed = await Promise.all(selected.map(readJsonFile));
+      const accounts = parsed
+        .flatMap(candidateSub2ApiAccounts)
+        .map(sub2ApiAccountPayload)
+        .filter((item): item is AccountImportPayload => Boolean(item));
+      const uniqueAccounts = Array.from(new Map(accounts.map((item) => [item.access_token, item])).values());
+      if (uniqueAccounts.length === 0) {
+        toast.error("未从 Sub2API JSON 中读取到账号凭据");
+        return;
+      }
+      const data = await createAccounts([], uniqueAccounts);
+      onImported(data.items);
+      handleOpenChange(false);
+      toast.success(`Sub2API JSON 导入完成，识别 ${uniqueAccounts.length} 个账号，新增 ${data.added ?? 0} 个，跳过 ${data.skipped ?? 0} 个重复项`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Sub2API JSON 导入失败");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogContent showCloseButton={false} className="rounded-2xl p-6">
+        <DialogHeader className="gap-2">
+          <DialogTitle>导入 Sub2API JSON</DialogTitle>
+          <DialogDescription className="text-sm leading-6">
+            选择从 Sub2API 导出的账号 JSON 文件，系统会提取其中的 OAuth 凭据并标记为 Codex 账号。
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-4">
+          <div className="rounded-2xl border border-stone-200 bg-stone-50 p-4 text-sm leading-6 text-stone-600">
+            支持单个导出对象、数组，或包含 accounts/items/data 字段的导出文件。相同邮箱的 Personal OAuth 和 Codex 账号会作为不同账号保留。
+          </div>
+          <input
+            ref={inputRef}
+            type="file"
+            accept=".json,application/json"
+            multiple
+            className="hidden"
+            onChange={(event) => void handleFiles(event.target.files)}
+          />
+          <Button
+            type="button"
+            className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
+            onClick={() => inputRef.current?.click()}
+            disabled={submitting}
+          >
+            {submitting ? <LoaderCircle className="size-4 animate-spin" /> : <FileJson className="size-4" />}
+            选择 JSON 文件
+          </Button>
+        </div>
+        <DialogFooter className="pt-2">
+          <Button
+            variant="secondary"
+            className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
+            onClick={() => handleOpenChange(false)}
+            disabled={submitting}
+          >
+            取消
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function AccountsPageContent() {
   const { accounts, setAccounts, isLoading, load } = useAccounts();
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [defaultPendingId, setDefaultPendingId] = useState<string | null>(null);
   const [oauthOpen, setOauthOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  const [sub2ApiImportOpen, setSub2ApiImportOpen] = useState(false);
 
   const handleDelete = async (id: string) => {
     setDeletingId(id);
@@ -426,6 +582,14 @@ function AccountsPageContent() {
             <Upload className="size-4" />
             导入 Token
           </Button>
+          <Button
+            variant="outline"
+            className="h-10 rounded-xl border-violet-200 bg-violet-50 px-4 text-violet-700 hover:bg-violet-100"
+            onClick={() => setSub2ApiImportOpen(true)}
+          >
+            <FileJson className="size-4" />
+            导入 Sub2API JSON
+          </Button>
         </div>
       </section>
 
@@ -456,6 +620,9 @@ function AccountsPageContent() {
                   <div className="min-w-0 space-y-2">
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="text-base font-semibold text-stone-900">{account.email ?? "未识别邮箱"}</span>
+                      <Badge variant="outline" className={cn("rounded-md", accountSourceClassName(account))}>
+                        {accountSourceLabel(account)}
+                      </Badge>
                       {account.is_default ? (
                         <Badge variant="success" className="rounded-md">
                           <CheckCircle2 className="mr-1 size-3" />
@@ -516,6 +683,7 @@ function AccountsPageContent() {
 
       <OAuthDialog open={oauthOpen} onOpenChange={setOauthOpen} onImported={(items) => setAccounts(items)} />
       <ImportTokenDialog open={importOpen} onOpenChange={setImportOpen} onImported={(items) => setAccounts(items)} />
+      <ImportSub2ApiDialog open={sub2ApiImportOpen} onOpenChange={setSub2ApiImportOpen} onImported={(items) => setAccounts(items)} />
     </>
   );
 }

@@ -76,6 +76,42 @@ class TestPersonalAccountService(unittest.TestCase):
         self.assertEqual(account["account_id"], "acc-123")
         self.assertEqual(account["type"], "plus")
 
+    def test_add_account_preserves_codex_source_metadata(self):
+        account = self.service.add_account({
+            "access_token": "codex-token",
+            "refresh_token": "refresh-token",
+            "id_token": jwt_token({"email": "person@example.com"}),
+            "source_type": "codex",
+            "export_type": "codex",
+            "name": "ChatGPT Pro 1",
+            "type": "pro",
+            "account_id": "acc-123",
+        })
+
+        self.assertEqual(account["source_type"], "codex")
+        self.assertEqual(account["export_type"], "codex")
+        self.assertEqual(account["name"], "ChatGPT Pro 1")
+        self.assertEqual(account["type"], "pro")
+        self.assertEqual(account["account_id"], "acc-123")
+
+    def test_same_email_can_exist_for_personal_oauth_and_codex_tokens(self):
+        id_token = jwt_token({"email": "person@example.com"})
+        personal = self.service.add_account({
+            "access_token": "personal-token",
+            "id_token": id_token,
+            "source_type": "oauth_login",
+        })
+        codex = self.service.add_account({
+            "access_token": "codex-token",
+            "id_token": id_token,
+            "source_type": "codex",
+        })
+
+        accounts = self.service.list_accounts()
+        self.assertEqual(len(accounts), 2)
+        self.assertEqual(personal["email"], codex["email"])
+        self.assertNotEqual(personal["id"], codex["id"])
+
     def test_get_active_access_token_with_no_account(self):
         self.assertEqual(self.service.get_active_access_token(), "")
 

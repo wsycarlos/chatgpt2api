@@ -16,11 +16,15 @@ export type ImageStorageSettings = {
 
 export type Account = {
   id: string;
+  name: string | null;
   access_token: string;
   refresh_token: string | null;
   id_token: string | null;
   email: string | null;
   account_id: string | null;
+  type: string | null;
+  source_type: string | null;
+  export_type: string | null;
   is_default: boolean;
   created_at: string;
   updated_at: string;
