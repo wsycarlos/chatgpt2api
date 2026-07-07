@@ -19,6 +19,7 @@ from services.protocol import (
     openai_v1_response,
     openai_search,
 )
+from utils.log import logger
 
 
 class ImageGenerationRequest(BaseModel):
@@ -94,11 +95,21 @@ def create_router() -> APIRouter:
             request: Request,
             authorization: str | None = Header(default=None),
     ):
+        logger.info({
+            "event": "image_generation_route_enter",
+            "model": body.model,
+            "stream": body.stream,
+            "n": body.n,
+            "size": body.size,
+            "quality": body.quality,
+            "client": request.client.host if request.client else "",
+        })
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
         payload["base_url"] = resolve_image_base_url(request)
         call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
         await filter_or_log(call, body.prompt)
+        logger.info({"event": "image_generation_route_dispatch", "model": body.model, "stream": body.stream})
         return await call.run(openai_v1_image_generations.handle, payload)
 
     @router.post("/v1/images/edits")
