@@ -1307,6 +1307,8 @@ def _generate_single_image(
                         account_email=account_email,
                         conversation_id=conv_id,
                     )
+                if failover_to_next_account("upstream returned no image output"):
+                    continue
                 return outputs
             return outputs
         except ImagePollTimeoutError as exc:
@@ -1405,7 +1407,7 @@ def _generate_single_image(
             })
             if not emitted_for_token and is_token_invalid_error(last_error):
                 refreshed = personal_account_service.refresh_access_token(account["id"])
-                if refreshed:
+                if refreshed and str(refreshed.get("access_token") or "") != token:
                     token = refreshed["access_token"]
                     account = refreshed
                     continue

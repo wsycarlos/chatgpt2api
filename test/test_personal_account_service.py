@@ -1,11 +1,21 @@
 import shutil
 import tempfile
 import unittest
+import base64
+import json
 from pathlib import Path
 from unittest import mock
 
 from services.personal_account_service import PersonalAccountService
 from services.storage.json_storage import JSONStorageBackend
+
+
+def jwt_token(payload: dict) -> str:
+    def encode(data: dict) -> str:
+        raw = json.dumps(data, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    return f"{encode({'alg': 'none'})}.{encode(payload)}.sig"
 
 
 class TestPersonalAccountService(unittest.TestCase):
@@ -45,6 +55,26 @@ class TestPersonalAccountService(unittest.TestCase):
         accounts = self.service.list_accounts()
         self.assertEqual(len(accounts), 1)
         self.assertEqual(accounts[0]["refresh_token"], "r2")
+
+    def test_add_account_derives_email_from_id_token(self):
+        id_token = jwt_token({"email": "person@example.com"})
+
+        account = self.service.add_account({"access_token": "t1", "id_token": id_token})
+
+        self.assertEqual(account["email"], "person@example.com")
+
+    def test_add_account_stores_chatgpt_auth_claims_from_access_token(self):
+        access_token = jwt_token({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acc-123",
+                "chatgpt_plan_type": "plus",
+            }
+        })
+
+        account = self.service.add_account({"access_token": access_token})
+
+        self.assertEqual(account["account_id"], "acc-123")
+        self.assertEqual(account["type"], "plus")
 
     def test_get_active_access_token_with_no_account(self):
         self.assertEqual(self.service.get_active_access_token(), "")
