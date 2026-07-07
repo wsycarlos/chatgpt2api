@@ -1,11 +1,21 @@
 import shutil
 import tempfile
 import unittest
+import base64
+import json
 from pathlib import Path
 from unittest import mock
 
 from services.personal_account_service import PersonalAccountService
 from services.storage.json_storage import JSONStorageBackend
+
+
+def jwt_token(payload: dict) -> str:
+    def encode(data: dict) -> str:
+        raw = json.dumps(data, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    return f"{encode({'alg': 'none'})}.{encode(payload)}.sig"
 
 
 class TestPersonalAccountService(unittest.TestCase):
@@ -46,8 +56,57 @@ class TestPersonalAccountService(unittest.TestCase):
         self.assertEqual(len(accounts), 1)
         self.assertEqual(accounts[0]["refresh_token"], "r2")
 
+    def test_add_account_derives_email_from_id_token(self):
+        id_token = jwt_token({"email": "person@example.com"})
+
+        account = self.service.add_account({"access_token": "t1", "id_token": id_token})
+
+        self.assertEqual(account["email"], "person@example.com")
+
+    def test_add_account_stores_chatgpt_auth_claims_from_access_token(self):
+        access_token = jwt_token({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acc-123",
+                "chatgpt_plan_type": "plus",
+            }
+        })
+
+        account = self.service.add_account({"access_token": access_token})
+
+        self.assertEqual(account["account_id"], "acc-123")
+        self.assertEqual(account["type"], "plus")
+
     def test_get_active_access_token_with_no_account(self):
         self.assertEqual(self.service.get_active_access_token(), "")
+
+    def test_switch_active_account_moves_to_next_account(self):
+        first = self.service.add_account({"access_token": "t1", "email": "a@example.com"})
+        second = self.service.add_account({"access_token": "t2", "email": "b@example.com"})
+
+        active = self.service.switch_active_account(first["id"])
+
+        self.assertEqual(active["id"], second["id"])
+        self.assertEqual(self.service.get_default_account()["id"], second["id"])
+
+    def test_switch_active_account_wraps_to_first_account(self):
+        first = self.service.add_account({"access_token": "t1", "email": "a@example.com"})
+        second = self.service.add_account({"access_token": "t2", "email": "b@example.com"})
+        self.service.set_default(second["id"])
+
+        active = self.service.switch_active_account(second["id"])
+
+        self.assertEqual(active["id"], first["id"])
+        self.assertEqual(self.service.get_default_account()["id"], first["id"])
+
+    def test_restore_active_account_switches_back_to_first_attempt(self):
+        first = self.service.add_account({"access_token": "t1", "email": "a@example.com"})
+        second = self.service.add_account({"access_token": "t2", "email": "b@example.com"})
+        self.service.set_default(second["id"])
+
+        restored = self.service.restore_active_account(first["id"])
+
+        self.assertEqual(restored["id"], first["id"])
+        self.assertEqual(self.service.get_default_account()["id"], first["id"])
 
     @mock.patch("services.personal_account_service.requests.Session")
     def test_refresh_access_token(self, mock_session_cls):

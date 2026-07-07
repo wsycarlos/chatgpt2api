@@ -81,13 +81,22 @@ class PersonalAccountService:
         access_token = str(item.get("access_token") or "").strip()
         if not access_token:
             return None
+        id_token = str(item.get("id_token") or "").strip() or None
+        id_claims = _decode_jwt_payload(id_token or "")
+        access_claims = _decode_jwt_payload(access_token)
+        auth_claims = access_claims.get("https://api.openai.com/auth")
+        auth_claims = auth_claims if isinstance(auth_claims, dict) else {}
+        email = str(item.get("email") or id_claims.get("email") or "").strip() or None
+        account_id = str(item.get("account_id") or auth_claims.get("chatgpt_account_id") or "").strip() or None
+        account_type = str(item.get("type") or auth_claims.get("chatgpt_plan_type") or "").strip() or None
         return {
             "id": str(item.get("id") or uuid.uuid4().hex[:12]),
-            "email": str(item.get("email") or "").strip() or None,
-            "account_id": str(item.get("account_id") or "").strip() or None,
+            "email": email,
+            "account_id": account_id,
+            "type": account_type,
             "access_token": access_token,
             "refresh_token": str(item.get("refresh_token") or "").strip() or None,
-            "id_token": str(item.get("id_token") or "").strip() or None,
+            "id_token": id_token,
             "is_default": bool(item.get("is_default", False)),
             "created_at": str(item.get("created_at") or _now_iso()),
             "updated_at": str(item.get("updated_at") or _now_iso()),
@@ -114,6 +123,23 @@ class PersonalAccountService:
             if account.get("is_default"):
                 return dict(account)
         return dict(accounts[0])
+
+    def switch_active_account(self, current_account_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            if not self._accounts:
+                return None
+            current_index = next(
+                (index for index, account in enumerate(self._accounts) if account.get("id") == current_account_id),
+                -1,
+            )
+            next_index = (current_index + 1) % len(self._accounts) if current_index >= 0 else 0
+            for index, account in enumerate(self._accounts):
+                account["is_default"] = index == next_index
+            self._save()
+            return dict(self._accounts[next_index])
+
+    def restore_active_account(self, account_id: str) -> dict[str, Any] | None:
+        return self.set_default(account_id)
 
     def set_default(self, account_id: str) -> dict[str, Any] | None:
         with self._lock:

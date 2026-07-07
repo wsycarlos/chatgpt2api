@@ -539,10 +539,14 @@ class OpenAIBackendAPI:
         }
 
     def _ensure_codex_source_account(self) -> None:
-        account = personal_account_service.get_default_account()
-        source_type = str((account or {}).get("source_type") or "web").strip().lower()
-        if source_type != "codex":
-            raise RuntimeError("codex responses endpoint requires a codex source account")
+        """在个人账号模式下，任何通过 OAuth 或 Token 导入的账号都可以尝试使用 Codex 生图。
+
+        原实现要求 source_type == "codex"，但个人账号模式的 source_type 通常为
+        "oauth_login" 或 "web"，这会导致合法账号无法使用 codex-gpt-image-2。
+        Codex 接口本身会根据 token 的订阅权限返回错误，因此这里不再额外限制。
+        """
+        if not personal_account_service.get_default_account():
+            raise RuntimeError("codex responses endpoint requires a configured account")
 
     @staticmethod
     def _codex_image_input(prompt: str, images: list[str]) -> list[Dict[str, Any]]:
