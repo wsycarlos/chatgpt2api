@@ -511,7 +511,7 @@ class OpenAIBackendAPI:
         if not base_model:
             return "auto"
         if base_model == "gpt-image-2":
-            return "gpt-5-3"
+            return "gpt-5-5-thinking"
         if base_model == CODEX_IMAGE_MODEL:
             return base_model
         return "auto"
@@ -969,7 +969,7 @@ class OpenAIBackendAPI:
                 "app_name": "chatgpt.com",
             },
             "paragen_cot_summary_display_override": "allow",
-            "force_parallel_switch": "balanced",
+            "force_parallel_switch": "auto",
         }
         path = "/backend-api/f/conversation"
         response = self.session.post(

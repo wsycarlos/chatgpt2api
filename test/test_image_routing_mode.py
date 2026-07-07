@@ -14,7 +14,12 @@ class _FakeResponse:
 
 
 class TestImageRoutingMode(unittest.TestCase):
-    def test_image_generation_uses_balanced_parallel_switch(self):
+    def test_gpt_image_2_uses_thinking_model_slug_for_balanced_mode(self):
+        backend = OpenAIBackendAPI(access_token="token")
+
+        self.assertEqual(backend._image_model_slug("gpt-image-2"), "gpt-5-5-thinking")
+
+    def test_image_generation_keeps_auto_parallel_switch(self):
         backend = OpenAIBackendAPI(access_token="token")
         captured_payloads = []
 
@@ -30,7 +35,7 @@ class TestImageRoutingMode(unittest.TestCase):
                 "gpt-image-2",
             )
 
-        self.assertEqual(captured_payloads[0]["force_parallel_switch"], "balanced")
+        self.assertEqual(captured_payloads[0]["force_parallel_switch"], "auto")
 
 
 if __name__ == "__main__":
