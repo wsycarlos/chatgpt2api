@@ -965,7 +965,7 @@ class OpenAIBackendAPI:
                 "app_name": "chatgpt.com",
             },
             "paragen_cot_summary_display_override": "allow",
-            "force_parallel_switch": "auto",
+            "force_parallel_switch": "balanced",
         }
         path = "/backend-api/f/conversation"
         response = self.session.post(
