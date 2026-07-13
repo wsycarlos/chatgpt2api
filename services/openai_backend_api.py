@@ -50,6 +50,13 @@ class ChatRequirements:
     raw_finalize: Optional[Dict[str, Any]] = None
 
 
+@dataclass
+class SearchConversationState:
+    conversation_id: str
+    resume_token: str = ""
+    handoff: bool = False
+
+
 DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
 DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
@@ -1746,8 +1753,8 @@ class OpenAIBackendAPI:
             raise RuntimeError("access_token is required for search")
         conduit_token = self._prepare_search_conversation(prompt, model)
         self._bootstrap()
-        conversation_id = self._run_search_conversation(prompt, conduit_token, model)
-        return self._wait_search_result(conversation_id, timeout_secs, poll_interval_secs)
+        state = self._run_search_conversation(prompt, conduit_token, model)
+        return self._wait_search_result(state.conversation_id, timeout_secs, poll_interval_secs)
 
     def _prepare_search_conversation(self, prompt: str, model: str) -> str:
         path = "/backend-api/f/conversation/prepare"
@@ -1777,7 +1784,7 @@ class OpenAIBackendAPI:
             raise RuntimeError("missing conduit_token")
         return token
 
-    def _run_search_conversation(self, prompt: str, conduit_token: str, model: str) -> str:
+    def _run_search_conversation(self, prompt: str, conduit_token: str, model: str) -> SearchConversationState:
         requirements = self._get_chat_requirements()
         path = "/backend-api/f/conversation"
         response = self.session.post(
@@ -1819,16 +1826,26 @@ class OpenAIBackendAPI:
         )
         ensure_ok(response, path)
         conversation_id = ""
+        resume_token = ""
+        handoff = False
         try:
             for payload in iter_sse_payloads(response):
-                conversation_id = conversation_id or self._find_search_value(payload, "conversation_id")
                 if payload == "[DONE]":
                     break
+                try:
+                    event = json.loads(payload)
+                except (TypeError, ValueError):
+                    event = payload
+                conversation_id = conversation_id or self._find_search_value(event, "conversation_id")
+                if isinstance(event, dict) and event.get("type") == "resume_conversation_token":
+                    resume_token = str(event.get("token") or "")
+                if isinstance(event, dict) and event.get("type") == "stream_handoff":
+                    handoff = True
         finally:
             response.close()
         if not conversation_id:
             raise RuntimeError("conversation_id not found in stream")
-        return conversation_id
+        return SearchConversationState(conversation_id, resume_token, handoff)
 
     def _wait_search_result(self, conversation_id: str, timeout_secs: float, poll_interval_secs: float) -> Dict[str, Any]:
         deadline = time.time() + timeout_secs

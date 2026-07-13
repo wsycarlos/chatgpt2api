@@ -1,21 +1,45 @@
-from __future__ import annotations
-
 import json
-import sys
-from pathlib import Path
+import unittest
+from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from services.openai_backend_api import OpenAIBackendAPI
+from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI
 
 
-def main() -> None:
-    ACCESS_TOKEN = ""
-    PROMPT = "帮我去网上搜索关于chatgpt2api的相关项目"
-    if not ACCESS_TOKEN.strip():
-        raise ValueError("ACCESS_TOKEN is empty")
-    print(json.dumps(OpenAIBackendAPI(ACCESS_TOKEN).search(PROMPT), ensure_ascii=False, indent=2))
+class FakeResponse:
+    def __init__(self, payloads: list[object]) -> None:
+        self.lines = [f"data: {json.dumps(payload)}".encode() for payload in payloads]
+        self.closed = False
+        self.status_code = 200
+
+    def iter_lines(self):
+        return iter(self.lines)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class SearchHandoffTests(unittest.TestCase):
+    def test_run_search_conversation_captures_handoff_metadata(self) -> None:
+        response = FakeResponse([
+            {
+                "type": "resume_conversation_token",
+                "token": "resume-token",
+                "conversation_id": "conv-1",
+            },
+            {"type": "stream_handoff", "conversation_id": "conv-1"},
+            "[DONE]",
+        ])
+        backend = OpenAIBackendAPI(access_token="token")
+        backend.session.post = mock.Mock(return_value=response)
+        backend._get_chat_requirements = mock.Mock(return_value=ChatRequirements(token="requirements-token"))
+
+        state = backend._run_search_conversation("prompt", "conduit-token", "model")
+
+        self.assertEqual(state.conversation_id, "conv-1")
+        self.assertEqual(state.resume_token, "resume-token")
+        self.assertTrue(state.handoff)
+        self.assertTrue(response.closed)
 
 
 if __name__ == "__main__":
-    main()
+    unittest.main()
