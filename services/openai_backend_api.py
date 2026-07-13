@@ -1,4 +1,5 @@
 import base64
+import copy
 import json
 import mimetypes
 import os
@@ -1913,8 +1914,9 @@ class OpenAIBackendAPI:
                     continue
                 candidate = self._find_search_message(event)
                 if candidate:
-                    message = candidate
+                    message = copy.deepcopy(candidate)
                     text = self._search_message_text(message)
+                    result = {}
                 elif self._has_search_message(event):
                     message = {}
                     text = ""
@@ -1922,22 +1924,36 @@ class OpenAIBackendAPI:
                     text = apply_text_patch(event, text)
                     self._apply_search_message_patch(message, event)
                 if message and text:
-                    message["content"] = {"content_type": "text", "parts": [text]}
-                    candidate_result = self._search_result_from_message(conversation_id, message)
-                    if candidate_result["status"] in SEARCH_DONE_STATUS:
-                        result = candidate_result
+                    self._set_search_message_text(message, text)
+                    result = self._search_result_from_message(conversation_id, message)
         finally:
             response.close()
         return result
 
     def _has_search_message(self, payload: Any) -> bool:
         if isinstance(payload, dict):
+            if isinstance(payload.get("author"), dict) and "content" in payload:
+                return True
             if isinstance(payload.get("message"), dict):
                 return True
             return any(self._has_search_message(value) for value in payload.values())
         if isinstance(payload, list):
             return any(self._has_search_message(value) for value in payload)
         return False
+
+    @staticmethod
+    def _set_search_message_text(message: Dict[str, Any], text: str) -> None:
+        content = message.get("content")
+        if not isinstance(content, dict):
+            message["content"] = {"content_type": "text", "parts": [text]}
+            return
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            content["parts"] = [text]
+        elif parts:
+            parts[0] = text
+        else:
+            parts.append(text)
 
     def _apply_search_message_patch(self, message: Dict[str, Any], event: Dict[str, Any]) -> None:
         operations = event.get("v") if event.get("o") == "patch" else [event]

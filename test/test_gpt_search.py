@@ -211,6 +211,104 @@ class SearchHandoffTests(unittest.TestCase):
     def test_strip_history_keeps_default_history_argument(self) -> None:
         self.assertEqual(strip_history("answer"), "answer")
 
+    def test_resume_search_result_treats_bare_message_as_patch_boundary(self) -> None:
+        response = FakeResponse([
+            {"message": {
+                "id": "final-1",
+                "author": {"role": "assistant"},
+                "channel": "final",
+                "content": {"content_type": "text", "parts": ["Good"]},
+                "status": "finished_successfully",
+            }},
+            {
+                "id": "tool-1",
+                "author": {"role": "tool"},
+                "content": {"content_type": "text", "parts": [""]},
+                "status": "in_progress",
+            },
+            {"p": "/message/content/parts/0", "o": "append", "v": " LEAK"},
+            "[DONE]",
+        ])
+        backend = OpenAIBackendAPI(access_token="token")
+        backend.session.post = mock.Mock(return_value=response)
+
+        result = backend._resume_search_result("conv-1", "resume-token")
+
+        self.assertEqual(result["answer"], "Good")
+
+    def test_resume_search_result_retains_nonterminal_final_without_handoff(self) -> None:
+        response = FakeResponse([
+            {"message": {
+                "id": "final-usable",
+                "author": {"role": "assistant"},
+                "channel": "final",
+                "content": {"content_type": "text", "parts": ["Usable answer"]},
+                "status": "in_progress",
+            }},
+            "[DONE]",
+        ])
+        backend = OpenAIBackendAPI(access_token="token")
+        backend.session.post = mock.Mock(return_value=response)
+
+        result = backend._resume_search_result("conv-1", "resume-token")
+
+        self.assertEqual(result["answer"], "Usable answer")
+        self.assertEqual(result["status"], "in_progress")
+
+    def test_resume_search_result_new_empty_final_supersedes_old_result(self) -> None:
+        response = FakeResponse([
+            {"message": {
+                "id": "final-old",
+                "author": {"role": "assistant"},
+                "channel": "final",
+                "content": {"content_type": "text", "parts": ["Old answer"]},
+                "status": "finished_successfully",
+            }},
+            {"message": {
+                "id": "final-new",
+                "author": {"role": "assistant"},
+                "channel": "final",
+                "content": {"content_type": "text", "parts": [""]},
+                "status": "in_progress",
+            }},
+            "[DONE]",
+        ])
+        backend = OpenAIBackendAPI(access_token="token")
+        backend.session.post = mock.Mock(return_value=response)
+
+        result = backend._resume_search_result("conv-1", "resume-token")
+
+        self.assertFalse(result.get("answer"))
+
+    def test_resume_search_result_preserves_structured_sources_during_patches(self) -> None:
+        response = FakeResponse([
+            {"message": {
+                "id": "final-source",
+                "author": {"role": "assistant"},
+                "channel": "final",
+                "content": {
+                    "content_type": "text",
+                    "parts": ["", {"title": "Structured", "url": "https://source.example"}],
+                },
+                "status": "in_progress",
+            }},
+            {"p": "/message/content/parts/0", "o": "append", "v": "Patched answer"},
+            {"p": "/message/status", "o": "replace", "v": "finished_successfully"},
+            "[DONE]",
+        ])
+        backend = OpenAIBackendAPI(access_token="token")
+        backend.session.post = mock.Mock(return_value=response)
+
+        result = backend._resume_search_result("conv-1", "resume-token")
+
+        self.assertEqual(result["answer"], "Patched answer")
+        self.assertIn({
+            "title": "Structured",
+            "url": "https://source.example",
+            "snippet": "",
+            "source_type": "",
+        }, result["sources"])
+
 
 if __name__ == "__main__":
     unittest.main()
