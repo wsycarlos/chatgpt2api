@@ -9,7 +9,7 @@ from curl_cffi import requests
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI, SearchConversationState
-from utils.conversation_patch import strip_history
+from utils.conversation_patch import apply_patch_op, strip_history
 from utils.helper import UpstreamHTTPError
 
 
@@ -27,6 +27,19 @@ class FakeResponse:
 
     def close(self) -> None:
         self.closed = True
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
 
 
 class SearchHandoffTests(unittest.TestCase):
@@ -91,6 +104,34 @@ class SearchHandoffTests(unittest.TestCase):
 
                 self.assertEqual(result, {"answer": "polled"})
                 backend._wait_search_result.assert_called_once_with("conv-1", 275.0, 3.0)
+
+    def test_search_resume_error_polling_extracts_final_message(self) -> None:
+        backend = self._search_backend(SearchConversationState("conv-1", "resume-token", True))
+        backend._resume_search_result.side_effect = UpstreamHTTPError("resume", 404, "retry")
+        backend._wait_search_result = OpenAIBackendAPI._wait_search_result.__get__(backend)
+        backend._get_search_conversation = mock.Mock(return_value={"mapping": {
+            "final": {"message": {
+                "id": "final-1",
+                "author": {"role": "assistant"},
+                "channel": "final",
+                "content": {"content_type": "text", "parts": ["Final answer"]},
+                "metadata": {"status": "finished_successfully"},
+                "create_time": 1.0,
+            }},
+            "analysis": {"message": {
+                "id": "analysis-2",
+                "author": {"role": "assistant"},
+                "channel": "analysis",
+                "content": {"content_type": "text", "parts": ["Private analysis"]},
+                "create_time": 2.0,
+            }},
+        }})
+
+        with mock.patch("services.openai_backend_api.time.monotonic", return_value=100.0):
+            result = backend.search("prompt", timeout_secs=5.0, poll_interval_secs=1.0)
+
+        self.assertEqual(result["answer"], "Final answer")
+        self.assertEqual(result["assistant_message_id"], "final-1")
 
     def test_search_resume_transport_error_falls_back_with_remaining_timeout(self) -> None:
         backend = self._search_backend(SearchConversationState("conv-1", "resume-token", True))
@@ -218,6 +259,93 @@ class SearchHandoffTests(unittest.TestCase):
         self.assertEqual(request.kwargs["timeout"], 17.5)
         self.assertTrue(response.closed)
 
+    def test_extract_search_result_chooses_newest_eligible_final_message(self) -> None:
+        backend = OpenAIBackendAPI(access_token="token")
+        conversation = {"mapping": {
+            "legacy": {"message": {
+                "id": "legacy-1",
+                "author": {"role": "assistant"},
+                "content": {"content_type": "text", "parts": ["Legacy answer"]},
+                "create_time": 1.0,
+            }},
+            "final": {"message": {
+                "id": "final-2",
+                "author": {"role": "assistant"},
+                "channel": "final",
+                "content": {"content_type": "text", "parts": ["Final answer"]},
+                "create_time": 2.0,
+            }},
+            "analysis": {"message": {
+                "id": "analysis-3",
+                "author": {"role": "assistant"},
+                "channel": "analysis",
+                "content": {"content_type": "text", "parts": ["Private analysis"]},
+                "create_time": 3.0,
+            }},
+        }}
+
+        result = backend._extract_search_result("conv-1", conversation)
+
+        self.assertEqual(result["answer"], "Final answer")
+        self.assertEqual(result["assistant_message_id"], "final-2")
+
+    def test_extract_search_result_accepts_legacy_text_without_channel(self) -> None:
+        backend = OpenAIBackendAPI(access_token="token")
+        conversation = {"mapping": {"legacy": {"message": {
+            "id": "legacy-1",
+            "author": {"role": "assistant"},
+            "content": {"content_type": "text", "parts": ["Legacy answer"]},
+            "create_time": 1.0,
+        }}}}
+
+        result = backend._extract_search_result("conv-1", conversation)
+
+        self.assertEqual(result["answer"], "Legacy answer")
+
+    def test_wait_search_result_caps_get_timeout_and_sleep_to_deadline(self) -> None:
+        backend = OpenAIBackendAPI(access_token="token")
+        backend._get_search_conversation = mock.Mock(return_value={"mapping": {}})
+
+        with mock.patch("services.openai_backend_api.time.monotonic", side_effect=[100.0, 102.0, 103.0, 105.0]), \
+                mock.patch("services.openai_backend_api.time.sleep") as sleep:
+            result = backend._wait_search_result("conv-1", 5.0, 10.0)
+
+        self.assertEqual(result["answer"], "")
+        backend._get_search_conversation.assert_called_once_with("conv-1", timeout_secs=3.0)
+        sleep.assert_called_once_with(2.0)
+
+    def test_wait_search_result_zero_timeout_does_not_get_or_sleep(self) -> None:
+        backend = OpenAIBackendAPI(access_token="token")
+        backend._get_search_conversation = mock.Mock()
+
+        with mock.patch("services.openai_backend_api.time.sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "timed out waiting"):
+                backend._wait_search_result("conv-1", 0, 1.0)
+
+        backend._get_search_conversation.assert_not_called()
+        sleep.assert_not_called()
+
+    def test_wait_search_result_transient_failures_do_not_stabilize_stale_result(self) -> None:
+        backend = OpenAIBackendAPI(access_token="token")
+        partial = {"mapping": {"final": {"message": {
+            "id": "final-partial",
+            "author": {"role": "assistant"},
+            "channel": "final",
+            "content": {"content_type": "text", "parts": ["Partial answer"]},
+            "status": "in_progress",
+        }}}}
+        transient = UpstreamHTTPError("poll", 503, "retry")
+        backend._get_search_conversation = mock.Mock(side_effect=[partial, transient, transient])
+        clock = FakeClock()
+
+        with mock.patch("services.openai_backend_api.time.monotonic", side_effect=clock.monotonic), \
+                mock.patch("services.openai_backend_api.time.sleep", side_effect=clock.sleep):
+            result = backend._wait_search_result("conv-1", 3.0, 1.0)
+
+        self.assertEqual(result["answer"], "Partial answer")
+        self.assertEqual(backend._get_search_conversation.call_count, 3)
+        self.assertEqual(clock.sleeps, [1.0, 1.0, 1.0])
+
     def test_resume_search_result_decodes_v1_final_message_patches(self) -> None:
         response = FakeResponse([
             "v1",
@@ -316,6 +444,11 @@ class SearchHandoffTests(unittest.TestCase):
 
     def test_strip_history_keeps_default_history_argument(self) -> None:
         self.assertEqual(strip_history("answer"), "answer")
+
+    def test_protocol_conversation_reexports_apply_patch_op(self) -> None:
+        from services.protocol.conversation import apply_patch_op as protocol_apply_patch_op
+
+        self.assertIs(protocol_apply_patch_op, apply_patch_op)
 
     def test_resume_search_result_treats_bare_message_as_patch_boundary(self) -> None:
         response = FakeResponse([

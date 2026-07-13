@@ -1866,35 +1866,46 @@ class OpenAIBackendAPI:
         return SearchConversationState(conversation_id, resume_token, handoff)
 
     def _wait_search_result(self, conversation_id: str, timeout_secs: float, poll_interval_secs: float) -> Dict[str, Any]:
-        deadline = time.time() + timeout_secs
+        deadline = time.monotonic() + timeout_secs
         last_result: Dict[str, Any] | None = None
         last_answer = ""
         stable_hits = 0
-        while time.time() < deadline:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            current_result: Dict[str, Any] | None = None
             try:
-                last_result = self._extract_search_result(conversation_id, self._get_search_conversation(conversation_id))
+                current_result = self._extract_search_result(
+                    conversation_id,
+                    self._get_search_conversation(conversation_id, timeout_secs=min(60, remaining)),
+                )
+                last_result = current_result
             except UpstreamHTTPError as exc:
                 if exc.status_code not in SEARCH_TRANSIENT_STATUS_CODES:
                     raise
-            if last_result and last_result.get("answer"):
-                if last_result.get("status") in SEARCH_DONE_STATUS:
-                    return last_result
-                answer = str(last_result.get("answer") or "")
+            if current_result and current_result.get("answer"):
+                if current_result.get("status") in SEARCH_DONE_STATUS:
+                    return current_result
+                answer = str(current_result.get("answer") or "")
                 stable_hits = stable_hits + 1 if answer == last_answer else 0
                 last_answer = answer
                 if stable_hits >= 2:
-                    return last_result
-            time.sleep(poll_interval_secs)
+                    return current_result
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(poll_interval_secs, remaining))
         if last_result:
             return last_result
         raise RuntimeError(f"timed out waiting for search result: {conversation_id}")
 
-    def _get_search_conversation(self, conversation_id: str) -> Dict[str, Any]:
+    def _get_search_conversation(self, conversation_id: str, timeout_secs: float = 60) -> Dict[str, Any]:
         path = f"/backend-api/conversation/{conversation_id}"
         headers = self._headers(path, {"Accept": "*/*"})
         headers["Referer"] = f"{self.base_url}/c/{conversation_id}"
         headers["X-OpenAI-Target-Route"] = "/backend-api/conversation/{conversation_id}"
-        response = self.session.get(self.base_url + path, headers=headers, timeout=60)
+        response = self.session.get(self.base_url + path, headers=headers, timeout=timeout_secs)
         ensure_ok(response, path)
         return response.json()
 
@@ -2002,28 +2013,41 @@ class OpenAIBackendAPI:
         return {}
 
     @staticmethod
-    def _is_final_search_message(message: Any) -> bool:
-        if not isinstance(message, dict) or ((message.get("author") or {}).get("role") or "") != "assistant":
+    def _is_final_search_message(message: Any, allow_missing_channel: bool = False) -> bool:
+        if not isinstance(message, dict):
             return False
-        metadata: Dict[str, Any] = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
-        if str(message.get("channel") or metadata.get("channel") or "").lower() != "final":
+        author = message.get("author")
+        if not isinstance(author, dict) or str(author.get("role") or "") != "assistant":
             return False
-        content: Dict[str, Any] = message.get("content") if isinstance(message.get("content"), dict) else {}
+        raw_metadata = message.get("metadata")
+        metadata: Dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
+        channel = str(message.get("channel") or metadata.get("channel") or "").lower()
+        if channel != "final" and (channel or not allow_missing_channel):
+            return False
+        raw_content = message.get("content")
+        content: Dict[str, Any] = raw_content if isinstance(raw_content, dict) else {}
         content_type = str(content.get("content_type") or "").lower()
         return "thought" not in content_type and "reasoning" not in content_type
 
     def _extract_search_result(self, conversation_id: str, conversation: Dict[str, Any]) -> Dict[str, Any]:
-        messages = []
-        for node in (conversation.get("mapping") or {}).values():
-            message = (node or {}).get("message") or {}
-            if ((message.get("author") or {}).get("role") or "") == "assistant":
+        messages: list[Dict[str, Any]] = []
+        mapping = conversation.get("mapping")
+        if not isinstance(mapping, dict):
+            mapping = {}
+        for node in mapping.values():
+            if not isinstance(node, dict):
+                continue
+            message = node.get("message")
+            if isinstance(message, dict) and self._is_final_search_message(message, allow_missing_channel=True):
                 messages.append(message)
         message = max(messages, key=lambda item: float(item.get("create_time") or 0.0)) if messages else {}
         return self._search_result_from_message(conversation_id, message)
 
     def _search_result_from_message(self, conversation_id: str, message: Dict[str, Any]) -> Dict[str, Any]:
-        metadata: Dict[str, Any] = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
-        finish_details: Dict[str, Any] = metadata.get("finish_details") if isinstance(metadata.get("finish_details"), dict) else {}
+        raw_metadata = message.get("metadata")
+        metadata: Dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
+        raw_finish_details = metadata.get("finish_details")
+        finish_details: Dict[str, Any] = raw_finish_details if isinstance(raw_finish_details, dict) else {}
         answer = self._search_message_text(message)
         sources = self._extract_search_sources(message)
         for url in SEARCH_URL_RE.findall(answer):
