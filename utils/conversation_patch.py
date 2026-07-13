@@ -36,7 +36,7 @@ def apply_patch_op(operation: dict[str, Any], current_text: str, history_text: s
     return current_text
 
 
-def strip_history(text: str, history_text: str) -> str:
+def strip_history(text: str, history_text: str = "") -> str:
     text = str(text or "")
     history_text = str(history_text or "")
     while history_text and text.startswith(history_text):

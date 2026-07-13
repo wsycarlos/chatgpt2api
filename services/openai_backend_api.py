@@ -1906,10 +1906,18 @@ class OpenAIBackendAPI:
                     event = json.loads(payload)
                 except (TypeError, ValueError):
                     continue
+                if isinstance(event, dict) and event.get("type") == "stream_handoff":
+                    result = {}
+                    message = {}
+                    text = ""
+                    continue
                 candidate = self._find_search_message(event)
                 if candidate:
                     message = candidate
                     text = self._search_message_text(message)
+                elif self._has_search_message(event):
+                    message = {}
+                    text = ""
                 elif message:
                     text = apply_text_patch(event, text)
                     self._apply_search_message_patch(message, event)
@@ -1921,6 +1929,15 @@ class OpenAIBackendAPI:
         finally:
             response.close()
         return result
+
+    def _has_search_message(self, payload: Any) -> bool:
+        if isinstance(payload, dict):
+            if isinstance(payload.get("message"), dict):
+                return True
+            return any(self._has_search_message(value) for value in payload.values())
+        if isinstance(payload, list):
+            return any(self._has_search_message(value) for value in payload)
+        return False
 
     def _apply_search_message_patch(self, message: Dict[str, Any], event: Dict[str, Any]) -> None:
         operations = event.get("v") if event.get("o") == "patch" else [event]

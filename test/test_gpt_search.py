@@ -7,6 +7,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI
+from utils.conversation_patch import strip_history
 
 
 class FakeResponse:
@@ -161,6 +162,54 @@ class SearchHandoffTests(unittest.TestCase):
         self.assertEqual(result["assistant_message_id"], "final-2")
         self.assertEqual(result["sources"][0]["url"], "https://example.com")
         self.assertTrue(response.closed)
+
+    def test_resume_search_result_does_not_patch_prior_final_after_new_message(self) -> None:
+        response = FakeResponse([
+            {"message": {
+                "id": "final-1",
+                "author": {"role": "assistant"},
+                "channel": "final",
+                "content": {"content_type": "text", "parts": ["Good"]},
+                "status": "finished_successfully",
+            }},
+            {"v": {"message": {
+                "id": "reasoning-2",
+                "author": {"role": "assistant"},
+                "channel": "analysis",
+                "content": {"content_type": "reasoning", "parts": [""]},
+                "status": "in_progress",
+            }}},
+            {"p": "/message/content/parts/0", "o": "append", "v": " SECRET"},
+            "[DONE]",
+        ])
+        backend = OpenAIBackendAPI(access_token="token")
+        backend.session.post = mock.Mock(return_value=response)
+
+        result = backend._resume_search_result("conv-1", "resume-token")
+
+        self.assertEqual(result["answer"], "Good")
+
+    def test_resume_search_result_invalidates_partial_result_on_handoff(self) -> None:
+        response = FakeResponse([
+            {"message": {
+                "id": "final-partial",
+                "author": {"role": "assistant"},
+                "channel": "final",
+                "content": {"content_type": "text", "parts": ["Partial answer"]},
+                "status": "finished_partial_completion",
+            }},
+            {"type": "stream_handoff", "conversation_id": "conv-1"},
+            "[DONE]",
+        ])
+        backend = OpenAIBackendAPI(access_token="token")
+        backend.session.post = mock.Mock(return_value=response)
+
+        result = backend._resume_search_result("conv-1", "resume-token")
+
+        self.assertFalse(result.get("answer"))
+
+    def test_strip_history_keeps_default_history_argument(self) -> None:
+        self.assertEqual(strip_history("answer"), "answer")
 
 
 if __name__ == "__main__":
