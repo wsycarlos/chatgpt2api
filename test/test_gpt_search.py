@@ -9,6 +9,7 @@ from curl_cffi import requests
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI, SearchConversationState
+from services.protocol.conversation import assistant_raw_text
 from utils.conversation_patch import apply_patch_op, strip_history
 from utils.helper import UpstreamHTTPError
 
@@ -445,6 +446,29 @@ class SearchHandoffTests(unittest.TestCase):
         self.assertEqual(result["answer"], "Partial answer")
         self.assertEqual(backend._get_search_conversation.call_count, 3)
         self.assertEqual(clock.sleeps, [1.0, 1.0, 1.0])
+
+    def test_wait_search_result_prefers_latest_nonempty_result_at_deadline(self) -> None:
+        backend = OpenAIBackendAPI(access_token="token")
+        usable = {"mapping": {"final": {"message": {
+            "id": "final-usable",
+            "author": {"role": "assistant"},
+            "channel": "final",
+            "content": {"content_type": "text", "parts": ["Usable answer"]},
+            "status": "in_progress",
+        }}}}
+        empty = {"mapping": {}}
+        backend._get_search_conversation = mock.Mock(side_effect=[usable, empty])
+        clock = FakeClock()
+
+        with mock.patch("services.openai_backend_api.time.monotonic", side_effect=clock.monotonic), \
+                mock.patch("services.openai_backend_api.time.sleep", side_effect=clock.sleep):
+            result = backend._wait_search_result("conv-1", 2.0, 1.0)
+
+        self.assertEqual(result["answer"], "Usable answer")
+        self.assertEqual(backend._get_search_conversation.call_count, 2)
+
+    def test_assistant_raw_text_ignores_bare_initial_protocol_marker(self) -> None:
+        self.assertEqual(assistant_raw_text({"v": "tool/progress"}, ""), "")
 
     def test_wait_search_result_requires_consecutive_successful_identical_polls(self) -> None:
         backend = OpenAIBackendAPI(access_token="token")

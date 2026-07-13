@@ -1868,6 +1868,7 @@ class OpenAIBackendAPI:
     def _wait_search_result(self, conversation_id: str, timeout_secs: float, poll_interval_secs: float) -> Dict[str, Any]:
         deadline = time.monotonic() + timeout_secs
         last_result: Dict[str, Any] | None = None
+        last_nonempty_result: Dict[str, Any] | None = None
         last_answer = ""
         stable_hits = 0
         while True:
@@ -1885,6 +1886,7 @@ class OpenAIBackendAPI:
                 if exc.status_code not in SEARCH_TRANSIENT_STATUS_CODES:
                     raise
             if current_result and current_result.get("answer"):
+                last_nonempty_result = current_result
                 if current_result.get("status") in SEARCH_DONE_STATUS:
                     return current_result
                 answer = str(current_result.get("answer") or "")
@@ -1899,6 +1901,8 @@ class OpenAIBackendAPI:
             if remaining <= 0:
                 break
             time.sleep(min(poll_interval_secs, remaining))
+        if last_nonempty_result:
+            return last_nonempty_result
         if last_result:
             return last_result
         raise RuntimeError(f"timed out waiting for search result: {conversation_id}")
@@ -1951,7 +1955,11 @@ class OpenAIBackendAPI:
                     message = {}
                     text = ""
                 elif message:
-                    text = apply_text_patch(event, text)
+                    bare_delta = event.get("v") if isinstance(event, dict) else None
+                    if isinstance(bare_delta, str) and not event.get("p") and not event.get("o"):
+                        text += bare_delta
+                    else:
+                        text = apply_text_patch(event, text)
                     self._apply_search_message_patch(message, event)
                 if message and text:
                     self._set_search_message_text(message, text)

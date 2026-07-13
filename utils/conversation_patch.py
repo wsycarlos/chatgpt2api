@@ -6,7 +6,7 @@ def apply_text_patch(event: dict[str, Any], current_text: str = "", history_text
         return apply_patch_op(event, current_text, history_text)
 
     operations = event.get("v")
-    if isinstance(operations, str) and not event.get("p") and not event.get("o"):
+    if isinstance(operations, str) and current_text and not event.get("p") and not event.get("o"):
         return current_text + operations
 
     if event.get("o") == "patch" and isinstance(operations, list):
