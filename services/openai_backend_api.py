@@ -1758,6 +1758,8 @@ class OpenAIBackendAPI:
         self._bootstrap()
         state = self._run_search_conversation(prompt, conduit_token, model)
         if state.handoff and state.resume_token:
+            if timeout_secs <= 0:
+                return self._wait_search_result(state.conversation_id, 0, poll_interval_secs)
             deadline = time.monotonic() + timeout_secs
             try:
                 result = self._resume_search_result(state.conversation_id, state.resume_token, timeout_secs)

@@ -69,6 +69,17 @@ class SearchHandoffTests(unittest.TestCase):
         backend._resume_search_result.assert_called_once_with("conv-1", "resume-token", 19.0)
         backend._wait_search_result.assert_not_called()
 
+    def test_search_nonpositive_timeout_skips_resume_and_polls_with_zero(self) -> None:
+        for timeout_secs in (0, -1.0):
+            with self.subTest(timeout_secs=timeout_secs):
+                backend = self._search_backend(SearchConversationState("conv-1", "resume-token", True))
+
+                result = backend.search("prompt", timeout_secs=timeout_secs, poll_interval_secs=0.5)
+
+                self.assertEqual(result, {"answer": "polled"})
+                backend._resume_search_result.assert_not_called()
+                backend._wait_search_result.assert_called_once_with("conv-1", 0, 0.5)
+
     def test_search_transient_resume_errors_fall_back_to_polling(self) -> None:
         for status_code in (404, 409, 423, 429, 500, 502, 503, 504):
             with self.subTest(status_code=status_code):
