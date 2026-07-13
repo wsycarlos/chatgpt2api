@@ -21,7 +21,7 @@ from utils.helper import (
     is_supported_image_model,
     split_image_model,
 )
-from utils.conversation_patch import apply_patch_op, apply_text_patch, strip_history
+from utils.conversation_patch import apply_patch_op as apply_patch_op, apply_text_patch, strip_history
 from utils.image_tokens import count_image_content_tokens
 from utils.log import logger
 

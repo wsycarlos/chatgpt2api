@@ -1892,6 +1892,9 @@ class OpenAIBackendAPI:
                 last_answer = answer
                 if stable_hits >= 2:
                     return current_result
+            else:
+                stable_hits = 0
+                last_answer = ""
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -2030,17 +2033,38 @@ class OpenAIBackendAPI:
         return "thought" not in content_type and "reasoning" not in content_type
 
     def _extract_search_result(self, conversation_id: str, conversation: Dict[str, Any]) -> Dict[str, Any]:
-        messages: list[Dict[str, Any]] = []
+        final_messages: list[Dict[str, Any]] = []
+        legacy_messages: list[Dict[str, Any]] = []
         mapping = conversation.get("mapping")
         if not isinstance(mapping, dict):
             mapping = {}
-        for node in mapping.values():
+        current_node = conversation.get("current_node")
+        nodes: list[Any] = []
+        if isinstance(current_node, str) and isinstance(mapping.get(current_node), dict):
+            node_id: Any = current_node
+            visited: set[str] = set()
+            while isinstance(node_id, str) and node_id not in visited:
+                node = mapping.get(node_id)
+                if not isinstance(node, dict):
+                    break
+                visited.add(node_id)
+                nodes.append(node)
+                node_id = node.get("parent")
+        else:
+            nodes = list(mapping.values())
+        for node in nodes:
             if not isinstance(node, dict):
                 continue
             message = node.get("message")
             if isinstance(message, dict) and self._is_final_search_message(message, allow_missing_channel=True):
-                messages.append(message)
-        message = max(messages, key=lambda item: float(item.get("create_time") or 0.0)) if messages else {}
+                raw_metadata = message.get("metadata")
+                metadata: Dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
+                channel = str(message.get("channel") or metadata.get("channel") or "").lower()
+                (final_messages if channel == "final" else legacy_messages).append(message)
+        messages = final_messages or legacy_messages
+        nonempty_messages = [item for item in messages if self._search_message_text(item)]
+        selectable_messages = nonempty_messages or messages
+        message = max(selectable_messages, key=lambda item: float(item.get("create_time") or 0.0)) if selectable_messages else {}
         return self._search_result_from_message(conversation_id, message)
 
     def _search_result_from_message(self, conversation_id: str, message: Dict[str, Any]) -> Dict[str, Any]:
@@ -2066,7 +2090,8 @@ class OpenAIBackendAPI:
     def _extract_search_sources(self, payload: Any) -> list[Dict[str, str]]:
         sources: list[Dict[str, str]] = []
         for obj in self._walk_search_dicts(payload):
-            metadata = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
+            raw_metadata = obj.get("metadata")
+            metadata: Dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
             url = self._clean_search_url(obj.get("url") or obj.get("link") or obj.get("source_url") or metadata.get("url"))
             if url and all(item["url"] != url for item in sources):
                 sources.append({

@@ -302,6 +302,106 @@ class SearchHandoffTests(unittest.TestCase):
 
         self.assertEqual(result["answer"], "Legacy answer")
 
+    def test_extract_search_result_prefers_explicit_final_over_newer_legacy(self) -> None:
+        backend = OpenAIBackendAPI(access_token="token")
+        conversation = {"mapping": {
+            "final": {"message": {
+                "id": "final-1",
+                "author": {"role": "assistant"},
+                "channel": "final",
+                "content": {"content_type": "text", "parts": ["Explicit final"]},
+                "create_time": 1.0,
+            }},
+            "legacy": {"message": {
+                "id": "legacy-2",
+                "author": {"role": "assistant"},
+                "content": {"content_type": "text", "parts": ["Newer legacy"]},
+                "create_time": 2.0,
+            }},
+        }}
+
+        result = backend._extract_search_result("conv-1", conversation)
+
+        self.assertEqual(result["answer"], "Explicit final")
+        self.assertEqual(result["assistant_message_id"], "final-1")
+
+    def test_extract_search_result_uses_only_active_current_node_branch(self) -> None:
+        backend = OpenAIBackendAPI(access_token="token")
+        conversation = {
+            "current_node": "active-final",
+            "mapping": {
+                "root": {"parent": None, "message": None},
+                "active-final": {"parent": "root", "message": {
+                    "id": "active-final",
+                    "author": {"role": "assistant"},
+                    "channel": "final",
+                    "content": {"content_type": "text", "parts": ["Active answer"]},
+                    "create_time": 1.0,
+                }},
+                "sibling-final": {"parent": "root", "message": {
+                    "id": "sibling-final",
+                    "author": {"role": "assistant"},
+                    "channel": "final",
+                    "content": {"content_type": "text", "parts": ["Inactive newer answer"]},
+                    "create_time": 2.0,
+                }},
+            },
+        }
+
+        result = backend._extract_search_result("conv-1", conversation)
+
+        self.assertEqual(result["answer"], "Active answer")
+        self.assertEqual(result["assistant_message_id"], "active-final")
+
+    def test_extract_search_result_prefers_newest_nonempty_eligible_message(self) -> None:
+        backend = OpenAIBackendAPI(access_token="token")
+        conversation = {"mapping": {
+            "old": {"message": {
+                "id": "final-old",
+                "author": {"role": "assistant"},
+                "channel": "final",
+                "content": {"content_type": "text", "parts": ["Older answer"]},
+                "create_time": 1.0,
+            }},
+            "new": {"message": {
+                "id": "final-new",
+                "author": {"role": "assistant"},
+                "channel": "final",
+                "content": {"content_type": "text", "parts": [""]},
+                "create_time": 2.0,
+            }},
+        }}
+
+        result = backend._extract_search_result("conv-1", conversation)
+
+        self.assertEqual(result["answer"], "Older answer")
+        self.assertEqual(result["assistant_message_id"], "final-old")
+
+    def test_extract_search_result_preserves_newest_empty_message_shape(self) -> None:
+        backend = OpenAIBackendAPI(access_token="token")
+        conversation = {"mapping": {
+            "old": {"message": {
+                "id": "final-old",
+                "author": {"role": "assistant"},
+                "channel": "final",
+                "content": {"content_type": "text", "parts": [""]},
+                "create_time": 1.0,
+            }},
+            "new": {"message": {
+                "id": "final-new",
+                "author": {"role": "assistant"},
+                "channel": "final",
+                "content": {"content_type": "text", "parts": [""]},
+                "create_time": 2.0,
+            }},
+        }}
+
+        result = backend._extract_search_result("conv-1", conversation)
+
+        self.assertEqual(result["answer"], "")
+        self.assertEqual(result["assistant_message_id"], "final-new")
+        self.assertEqual(result["create_time"], 2.0)
+
     def test_wait_search_result_caps_get_timeout_and_sleep_to_deadline(self) -> None:
         backend = OpenAIBackendAPI(access_token="token")
         backend._get_search_conversation = mock.Mock(return_value={"mapping": {}})
@@ -345,6 +445,38 @@ class SearchHandoffTests(unittest.TestCase):
         self.assertEqual(result["answer"], "Partial answer")
         self.assertEqual(backend._get_search_conversation.call_count, 3)
         self.assertEqual(clock.sleeps, [1.0, 1.0, 1.0])
+
+    def test_wait_search_result_requires_consecutive_successful_identical_polls(self) -> None:
+        backend = OpenAIBackendAPI(access_token="token")
+        partial = {"mapping": {"final": {"message": {
+            "id": "final-partial",
+            "author": {"role": "assistant"},
+            "channel": "final",
+            "content": {"content_type": "text", "parts": ["Same answer"]},
+            "status": "in_progress",
+        }}}}
+        completed = {"mapping": {"final": {"message": {
+            "id": "final-completed",
+            "author": {"role": "assistant"},
+            "channel": "final",
+            "content": {"content_type": "text", "parts": ["Completed answer"]},
+            "status": "finished_successfully",
+        }}}}
+        backend._get_search_conversation = mock.Mock(side_effect=[
+            partial,
+            partial,
+            UpstreamHTTPError("poll", 503, "retry"),
+            partial,
+            completed,
+        ])
+        clock = FakeClock()
+
+        with mock.patch("services.openai_backend_api.time.monotonic", side_effect=clock.monotonic), \
+                mock.patch("services.openai_backend_api.time.sleep", side_effect=clock.sleep):
+            result = backend._wait_search_result("conv-1", 5.0, 1.0)
+
+        self.assertEqual(result["answer"], "Completed answer")
+        self.assertEqual(backend._get_search_conversation.call_count, 5)
 
     def test_resume_search_result_decodes_v1_final_message_patches(self) -> None:
         response = FakeResponse([
@@ -396,6 +528,26 @@ class SearchHandoffTests(unittest.TestCase):
         self.assertEqual(result["assistant_message_id"], "final-2")
         self.assertEqual(result["sources"][0]["url"], "https://example.com")
         self.assertTrue(response.closed)
+
+    def test_resume_search_result_accepts_bare_first_delta_after_empty_final(self) -> None:
+        response = FakeResponse([
+            {"message": {
+                "id": "final-1",
+                "author": {"role": "assistant"},
+                "channel": "final",
+                "content": {"content_type": "text", "parts": [""]},
+                "status": "in_progress",
+            }},
+            {"v": "First delta"},
+            "[DONE]",
+        ])
+        backend = OpenAIBackendAPI(access_token="token")
+        backend.session.post = mock.Mock(return_value=response)
+
+        result = backend._resume_search_result("conv-1", "resume-token")
+
+        self.assertEqual(result["answer"], "First delta")
+        self.assertEqual(result["assistant_message_id"], "final-1")
 
     def test_resume_search_result_does_not_patch_prior_final_after_new_message(self) -> None:
         response = FakeResponse([
