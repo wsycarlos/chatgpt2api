@@ -52,6 +52,64 @@ class SearchHandoffTests(unittest.TestCase):
         self.assertTrue(state.handoff)
         self.assertTrue(response.closed)
 
+    def test_resume_search_result_returns_only_final_assistant_message(self) -> None:
+        response = FakeResponse([
+            {
+                "message": {
+                    "id": "reasoning-1",
+                    "author": {"role": "assistant"},
+                    "channel": "analysis",
+                    "content": {"content_type": "thought", "parts": ["Private reasoning"]},
+                },
+            },
+            "malformed payload",
+            {
+                "unrelated": {
+                    "message": {
+                        "id": "nested-user-1",
+                        "author": {"role": "assistant"},
+                        "channel": "final",
+                        "content": {"content_type": "text", "parts": ["Wrong answer"]},
+                    },
+                },
+                "message": {
+                    "id": "final-1",
+                    "author": {"role": "assistant"},
+                    "content": {"content_type": "text", "parts": ["Final answer https://example.com"]},
+                    "metadata": {
+                        "channel": "final",
+                        "finish_details": {"type": "finished_successfully"},
+                        "citations": [{"title": "Example", "url": "https://example.com"}],
+                    },
+                    "create_time": 123.0,
+                },
+            },
+            "[DONE]",
+        ])
+        backend = OpenAIBackendAPI(access_token="token")
+        backend.session.post = mock.Mock(return_value=response)
+
+        result = backend._resume_search_result("conv-1", "resume-token")
+
+        self.assertEqual(result, {
+            "conversation_id": "conv-1",
+            "status": "finished_successfully",
+            "answer": "Final answer https://example.com",
+            "sources": [{
+                "title": "Example",
+                "url": "https://example.com",
+                "snippet": "",
+                "source_type": "",
+            }],
+            "assistant_message_id": "final-1",
+            "create_time": 123.0,
+        })
+        request = backend.session.post.call_args
+        self.assertTrue(request.args[0].endswith("/backend-api/f/conversation/resume"))
+        self.assertEqual(request.kwargs["json"], {"conversation_id": "conv-1", "offset": 0})
+        self.assertEqual(request.kwargs["headers"]["X-Conduit-Token"], "resume-token")
+        self.assertTrue(response.closed)
+
 
 if __name__ == "__main__":
     unittest.main()

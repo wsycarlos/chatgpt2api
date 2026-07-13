@@ -1880,6 +1880,64 @@ class OpenAIBackendAPI:
         ensure_ok(response, path)
         return response.json()
 
+    def _resume_search_result(self, conversation_id: str, resume_token: str) -> Dict[str, Any]:
+        path = "/backend-api/f/conversation/resume"
+        response = self.session.post(
+            self.base_url + path,
+            headers=self._headers(path, {
+                "Accept": "text/event-stream",
+                "Content-Type": "application/json",
+                "X-Conduit-Token": resume_token,
+            }),
+            json={"conversation_id": conversation_id, "offset": 0},
+            stream=True,
+        )
+        result: Dict[str, Any] = {}
+        try:
+            ensure_ok(response, path)
+            for payload in iter_sse_payloads(response):
+                if payload == "[DONE]":
+                    break
+                try:
+                    event = json.loads(payload)
+                except (TypeError, ValueError):
+                    continue
+                message = self._find_search_message(event)
+                if message and self._search_message_text(message):
+                    result = self._search_result_from_message(conversation_id, message)
+        finally:
+            response.close()
+        return result
+
+    def _find_search_message(self, payload: Any) -> Dict[str, Any]:
+        if not isinstance(payload, (dict, list)):
+            return {}
+        candidates: list[Any] = []
+        if isinstance(payload, dict):
+            candidates.extend((payload, payload.get("message")))
+            nested = [value for key, value in payload.items() if key != "message"]
+        else:
+            nested = payload
+        for candidate in candidates:
+            if self._is_final_search_message(candidate):
+                return candidate
+        for value in nested:
+            message = self._find_search_message(value)
+            if message:
+                return message
+        return {}
+
+    @staticmethod
+    def _is_final_search_message(message: Any) -> bool:
+        if not isinstance(message, dict) or ((message.get("author") or {}).get("role") or "") != "assistant":
+            return False
+        metadata: Dict[str, Any] = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        if str(message.get("channel") or metadata.get("channel") or "").lower() != "final":
+            return False
+        content: Dict[str, Any] = message.get("content") if isinstance(message.get("content"), dict) else {}
+        content_type = str(content.get("content_type") or "").lower()
+        return "thought" not in content_type and "reasoning" not in content_type
+
     def _extract_search_result(self, conversation_id: str, conversation: Dict[str, Any]) -> Dict[str, Any]:
         messages = []
         for node in (conversation.get("mapping") or {}).values():
@@ -1887,8 +1945,11 @@ class OpenAIBackendAPI:
             if ((message.get("author") or {}).get("role") or "") == "assistant":
                 messages.append(message)
         message = max(messages, key=lambda item: float(item.get("create_time") or 0.0)) if messages else {}
-        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
-        finish_details = metadata.get("finish_details") if isinstance(metadata.get("finish_details"), dict) else {}
+        return self._search_result_from_message(conversation_id, message)
+
+    def _search_result_from_message(self, conversation_id: str, message: Dict[str, Any]) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        finish_details: Dict[str, Any] = metadata.get("finish_details") if isinstance(metadata.get("finish_details"), dict) else {}
         answer = self._search_message_text(message)
         sources = self._extract_search_sources(message)
         for url in SEARCH_URL_RE.findall(answer):
