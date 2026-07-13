@@ -1758,6 +1758,7 @@ class OpenAIBackendAPI:
         self._bootstrap()
         state = self._run_search_conversation(prompt, conduit_token, model)
         if state.handoff and state.resume_token:
+            deadline = time.monotonic() + timeout_secs
             try:
                 result = self._resume_search_result(state.conversation_id, state.resume_token, timeout_secs)
                 if result.get("answer"):
@@ -1765,6 +1766,10 @@ class OpenAIBackendAPI:
             except UpstreamHTTPError as exc:
                 if exc.status_code not in SEARCH_TRANSIENT_STATUS_CODES:
                     raise
+            except requests.RequestsError:
+                pass
+            remaining = max(0, deadline - time.monotonic())
+            return self._wait_search_result(state.conversation_id, remaining, poll_interval_secs)
         return self._wait_search_result(state.conversation_id, timeout_secs, poll_interval_secs)
 
     def _prepare_search_conversation(self, prompt: str, model: str) -> str:

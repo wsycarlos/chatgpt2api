@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from curl_cffi import requests
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI, SearchConversationState
@@ -50,10 +52,11 @@ class SearchHandoffTests(unittest.TestCase):
         backend = self._search_backend(SearchConversationState("conv-1", "resume-token", True))
         backend._resume_search_result.return_value = {}
 
-        result = backend.search("prompt")
+        with mock.patch("services.openai_backend_api.time.monotonic", side_effect=[100.0, 125.0]):
+            result = backend.search("prompt")
 
         self.assertEqual(result, {"answer": "polled"})
-        backend._wait_search_result.assert_called_once_with("conv-1", 300.0, 3.0)
+        backend._wait_search_result.assert_called_once_with("conv-1", 275.0, 3.0)
 
     def test_search_returns_nonempty_resumed_answer_without_polling(self) -> None:
         backend = self._search_backend(SearchConversationState("conv-1", "resume-token", True))
@@ -72,10 +75,21 @@ class SearchHandoffTests(unittest.TestCase):
                 backend = self._search_backend(SearchConversationState("conv-1", "resume-token", True))
                 backend._resume_search_result.side_effect = UpstreamHTTPError("resume", status_code, "retry")
 
-                result = backend.search("prompt")
+                with mock.patch("services.openai_backend_api.time.monotonic", side_effect=[100.0, 125.0]):
+                    result = backend.search("prompt")
 
                 self.assertEqual(result, {"answer": "polled"})
-                backend._wait_search_result.assert_called_once_with("conv-1", 300.0, 3.0)
+                backend._wait_search_result.assert_called_once_with("conv-1", 275.0, 3.0)
+
+    def test_search_resume_transport_error_falls_back_with_remaining_timeout(self) -> None:
+        backend = self._search_backend(SearchConversationState("conv-1", "resume-token", True))
+        backend._resume_search_result.side_effect = requests.RequestsError("connection reset")
+
+        with mock.patch("services.openai_backend_api.time.monotonic", side_effect=[50.0, 70.0]):
+            result = backend.search("prompt", timeout_secs=15.0, poll_interval_secs=0.5)
+
+        self.assertEqual(result, {"answer": "polled"})
+        backend._wait_search_result.assert_called_once_with("conv-1", 0, 0.5)
 
     def test_search_nontransient_resume_error_propagates_without_polling(self) -> None:
         backend = self._search_backend(SearchConversationState("conv-1", "resume-token", True))
@@ -83,6 +97,17 @@ class SearchHandoffTests(unittest.TestCase):
         backend._resume_search_result.side_effect = error
 
         with self.assertRaises(UpstreamHTTPError) as raised:
+            backend.search("prompt")
+
+        self.assertIs(raised.exception, error)
+        backend._wait_search_result.assert_not_called()
+
+    def test_search_resume_runtime_error_propagates_without_polling(self) -> None:
+        backend = self._search_backend(SearchConversationState("conv-1", "resume-token", True))
+        error = RuntimeError("programming error")
+        backend._resume_search_result.side_effect = error
+
+        with self.assertRaises(RuntimeError) as raised:
             backend.search("prompt")
 
         self.assertIs(raised.exception, error)
