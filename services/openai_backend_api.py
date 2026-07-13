@@ -68,6 +68,7 @@ SEARCH_MODEL = "gpt-5-5"
 SEARCH_TIMEOUT_SECS = 300.0
 SEARCH_POLL_INTERVAL_SECS = 3.0
 SEARCH_DONE_STATUS = {"finished_successfully", "finished_partial_completion"}
+SEARCH_TRANSIENT_STATUS_CODES = {404, 409, 423, 429, 500, 502, 503, 504}
 SEARCH_CONVERSATION_ID_RE = re.compile(r'"conversation_id"\s*:\s*"([^"]+)"')
 SEARCH_URL_RE = re.compile(r"https?://[^\s\"'<>）)\]}]+")
 EDITABLE_FILE_MODEL = "gpt-5-5-thinking"
@@ -1756,6 +1757,14 @@ class OpenAIBackendAPI:
         conduit_token = self._prepare_search_conversation(prompt, model)
         self._bootstrap()
         state = self._run_search_conversation(prompt, conduit_token, model)
+        if state.handoff and state.resume_token:
+            try:
+                result = self._resume_search_result(state.conversation_id, state.resume_token, timeout_secs)
+                if result.get("answer"):
+                    return result
+            except UpstreamHTTPError as exc:
+                if exc.status_code not in SEARCH_TRANSIENT_STATUS_CODES:
+                    raise
         return self._wait_search_result(state.conversation_id, timeout_secs, poll_interval_secs)
 
     def _prepare_search_conversation(self, prompt: str, model: str) -> str:
@@ -1858,7 +1867,7 @@ class OpenAIBackendAPI:
             try:
                 last_result = self._extract_search_result(conversation_id, self._get_search_conversation(conversation_id))
             except UpstreamHTTPError as exc:
-                if exc.status_code not in {404, 409, 423, 429, 500, 502, 503, 504}:
+                if exc.status_code not in SEARCH_TRANSIENT_STATUS_CODES:
                     raise
             if last_result and last_result.get("answer"):
                 if last_result.get("status") in SEARCH_DONE_STATUS:
@@ -1882,7 +1891,8 @@ class OpenAIBackendAPI:
         ensure_ok(response, path)
         return response.json()
 
-    def _resume_search_result(self, conversation_id: str, resume_token: str) -> Dict[str, Any]:
+    def _resume_search_result(self, conversation_id: str, resume_token: str,
+                              timeout_secs: float = SEARCH_TIMEOUT_SECS) -> Dict[str, Any]:
         path = "/backend-api/f/conversation/resume"
         response = self.session.post(
             self.base_url + path,
@@ -1893,7 +1903,7 @@ class OpenAIBackendAPI:
             }),
             json={"conversation_id": conversation_id, "offset": 0},
             stream=True,
-            timeout=SEARCH_TIMEOUT_SECS,
+            timeout=timeout_secs,
         )
         result: Dict[str, Any] = {}
         message: Dict[str, Any] = {}

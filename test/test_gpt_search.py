@@ -6,8 +6,9 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI
+from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI, SearchConversationState
 from utils.conversation_patch import strip_history
+from utils.helper import UpstreamHTTPError
 
 
 class FakeResponse:
@@ -27,6 +28,75 @@ class FakeResponse:
 
 
 class SearchHandoffTests(unittest.TestCase):
+    def _search_backend(self, state: SearchConversationState) -> OpenAIBackendAPI:
+        backend = OpenAIBackendAPI(access_token="token")
+        backend._prepare_search_conversation = mock.Mock(return_value="conduit-token")
+        backend._bootstrap = mock.Mock()
+        backend._run_search_conversation = mock.Mock(return_value=state)
+        backend._resume_search_result = mock.Mock()
+        backend._wait_search_result = mock.Mock(return_value={"answer": "polled"})
+        return backend
+
+    def test_search_handoff_without_resume_token_polls_with_custom_timing(self) -> None:
+        backend = self._search_backend(SearchConversationState("conv-1", handoff=True))
+
+        result = backend.search("prompt", timeout_secs=17.5, poll_interval_secs=0.25)
+
+        self.assertEqual(result, {"answer": "polled"})
+        backend._resume_search_result.assert_not_called()
+        backend._wait_search_result.assert_called_once_with("conv-1", 17.5, 0.25)
+
+    def test_search_empty_resume_result_falls_back_to_polling(self) -> None:
+        backend = self._search_backend(SearchConversationState("conv-1", "resume-token", True))
+        backend._resume_search_result.return_value = {}
+
+        result = backend.search("prompt")
+
+        self.assertEqual(result, {"answer": "polled"})
+        backend._wait_search_result.assert_called_once_with("conv-1", 300.0, 3.0)
+
+    def test_search_returns_nonempty_resumed_answer_without_polling(self) -> None:
+        backend = self._search_backend(SearchConversationState("conv-1", "resume-token", True))
+        resumed = {"answer": "resumed"}
+        backend._resume_search_result.return_value = resumed
+
+        result = backend.search("prompt", timeout_secs=19.0)
+
+        self.assertIs(result, resumed)
+        backend._resume_search_result.assert_called_once_with("conv-1", "resume-token", 19.0)
+        backend._wait_search_result.assert_not_called()
+
+    def test_search_transient_resume_errors_fall_back_to_polling(self) -> None:
+        for status_code in (404, 409, 423, 429, 500, 502, 503, 504):
+            with self.subTest(status_code=status_code):
+                backend = self._search_backend(SearchConversationState("conv-1", "resume-token", True))
+                backend._resume_search_result.side_effect = UpstreamHTTPError("resume", status_code, "retry")
+
+                result = backend.search("prompt")
+
+                self.assertEqual(result, {"answer": "polled"})
+                backend._wait_search_result.assert_called_once_with("conv-1", 300.0, 3.0)
+
+    def test_search_nontransient_resume_error_propagates_without_polling(self) -> None:
+        backend = self._search_backend(SearchConversationState("conv-1", "resume-token", True))
+        error = UpstreamHTTPError("resume", 400, "bad request")
+        backend._resume_search_result.side_effect = error
+
+        with self.assertRaises(UpstreamHTTPError) as raised:
+            backend.search("prompt")
+
+        self.assertIs(raised.exception, error)
+        backend._wait_search_result.assert_not_called()
+
+    def test_search_without_handoff_does_not_resume_even_with_token(self) -> None:
+        backend = self._search_backend(SearchConversationState("conv-1", "resume-token", False))
+
+        result = backend.search("prompt")
+
+        self.assertEqual(result, {"answer": "polled"})
+        backend._resume_search_result.assert_not_called()
+        backend._wait_search_result.assert_called_once_with("conv-1", 300.0, 3.0)
+
     def test_run_search_conversation_captures_handoff_metadata(self) -> None:
         response = FakeResponse([
             {
@@ -90,7 +160,7 @@ class SearchHandoffTests(unittest.TestCase):
         backend = OpenAIBackendAPI(access_token="token")
         backend.session.post = mock.Mock(return_value=response)
 
-        result = backend._resume_search_result("conv-1", "resume-token")
+        result = backend._resume_search_result("conv-1", "resume-token", timeout_secs=17.5)
 
         self.assertEqual(result, {
             "conversation_id": "conv-1",
@@ -109,7 +179,7 @@ class SearchHandoffTests(unittest.TestCase):
         self.assertTrue(request.args[0].endswith("/backend-api/f/conversation/resume"))
         self.assertEqual(request.kwargs["json"], {"conversation_id": "conv-1", "offset": 0})
         self.assertEqual(request.kwargs["headers"]["X-Conduit-Token"], "resume-token")
-        self.assertEqual(request.kwargs["timeout"], 300.0)
+        self.assertEqual(request.kwargs["timeout"], 17.5)
         self.assertTrue(response.closed)
 
     def test_resume_search_result_decodes_v1_final_message_patches(self) -> None:
