@@ -1916,7 +1916,6 @@ class OpenAIBackendAPI:
                 if candidate:
                     message = copy.deepcopy(candidate)
                     text = self._search_message_text(message)
-                    result = {}
                 elif self._has_search_message(event):
                     message = {}
                     text = ""

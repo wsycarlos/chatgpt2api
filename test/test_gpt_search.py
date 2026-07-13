@@ -255,7 +255,7 @@ class SearchHandoffTests(unittest.TestCase):
         self.assertEqual(result["answer"], "Usable answer")
         self.assertEqual(result["status"], "in_progress")
 
-    def test_resume_search_result_new_empty_final_supersedes_old_result(self) -> None:
+    def test_resume_search_result_new_empty_final_retains_old_result(self) -> None:
         response = FakeResponse([
             {"message": {
                 "id": "final-old",
@@ -271,6 +271,7 @@ class SearchHandoffTests(unittest.TestCase):
                 "content": {"content_type": "text", "parts": [""]},
                 "status": "in_progress",
             }},
+            {"p": "/message/status", "o": "replace", "v": "finished_successfully"},
             "[DONE]",
         ])
         backend = OpenAIBackendAPI(access_token="token")
@@ -278,7 +279,35 @@ class SearchHandoffTests(unittest.TestCase):
 
         result = backend._resume_search_result("conv-1", "resume-token")
 
-        self.assertFalse(result.get("answer"))
+        self.assertEqual(result["answer"], "Old answer")
+        self.assertEqual(result["assistant_message_id"], "final-old")
+
+    def test_resume_search_result_new_nonempty_final_replaces_old_result(self) -> None:
+        response = FakeResponse([
+            {"message": {
+                "id": "final-old",
+                "author": {"role": "assistant"},
+                "channel": "final",
+                "content": {"content_type": "text", "parts": ["Old answer"]},
+                "status": "finished_successfully",
+            }},
+            {"message": {
+                "id": "final-new",
+                "author": {"role": "assistant"},
+                "channel": "final",
+                "content": {"content_type": "text", "parts": [""]},
+                "status": "in_progress",
+            }},
+            {"p": "/message/content/parts/0", "o": "append", "v": "New answer"},
+            "[DONE]",
+        ])
+        backend = OpenAIBackendAPI(access_token="token")
+        backend.session.post = mock.Mock(return_value=response)
+
+        result = backend._resume_search_result("conv-1", "resume-token")
+
+        self.assertEqual(result["answer"], "New answer")
+        self.assertEqual(result["assistant_message_id"], "final-new")
 
     def test_resume_search_result_preserves_structured_sources_during_patches(self) -> None:
         response = FakeResponse([
