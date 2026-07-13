@@ -108,6 +108,58 @@ class SearchHandoffTests(unittest.TestCase):
         self.assertTrue(request.args[0].endswith("/backend-api/f/conversation/resume"))
         self.assertEqual(request.kwargs["json"], {"conversation_id": "conv-1", "offset": 0})
         self.assertEqual(request.kwargs["headers"]["X-Conduit-Token"], "resume-token")
+        self.assertEqual(request.kwargs["timeout"], 300.0)
+        self.assertTrue(response.closed)
+
+    def test_resume_search_result_decodes_v1_final_message_patches(self) -> None:
+        response = FakeResponse([
+            "v1",
+            {
+                "p": "",
+                "o": "add",
+                "v": {"message": {
+                    "id": "reasoning-1",
+                    "author": {"role": "assistant"},
+                    "channel": "analysis",
+                    "content": {"content_type": "reasoning", "parts": [""]},
+                    "status": "in_progress",
+                }},
+            },
+            {"p": "/message/content/parts/0", "o": "append", "v": "Private reasoning"},
+            {
+                "p": "",
+                "o": "add",
+                "v": {"message": {
+                    "id": "final-2",
+                    "author": {"role": "assistant"},
+                    "content": {"content_type": "text", "parts": [""]},
+                    "metadata": {
+                        "channel": "final",
+                        "citations": [{"title": "Example", "url": "https://example.com"}],
+                    },
+                    "status": "in_progress",
+                    "create_time": 456.0,
+                }},
+            },
+            {"p": "/message/content/parts/0", "o": "append", "v": "Final answer"},
+            {"v": " https://example.com"},
+            {"p": "", "o": "patch", "v": [
+                {"p": "/message/content/parts/0", "o": "append", "v": "!"},
+                {"p": "/message/status", "o": "replace", "v": "finished_successfully"},
+                {"p": "/message/end_turn", "o": "replace", "v": True},
+            ]},
+            "[DONE]",
+        ])
+        backend = OpenAIBackendAPI(access_token="token")
+        backend.session.post = mock.Mock(return_value=response)
+
+        result = backend._resume_search_result("conv-1", "resume-token")
+
+        self.assertEqual(result["answer"], "Final answer https://example.com!")
+        self.assertNotIn("Private reasoning", result["answer"])
+        self.assertEqual(result["status"], "finished_successfully")
+        self.assertEqual(result["assistant_message_id"], "final-2")
+        self.assertEqual(result["sources"][0]["url"], "https://example.com")
         self.assertTrue(response.closed)
 
 

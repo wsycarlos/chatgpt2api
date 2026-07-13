@@ -22,6 +22,7 @@ from PIL import Image
 from services.config import config
 from services.personal_account_service import _decode_jwt_payload, personal_account_service
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
+from utils.conversation_patch import apply_text_patch
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
 from utils.turnstile import solve_turnstile_token
@@ -1891,8 +1892,11 @@ class OpenAIBackendAPI:
             }),
             json={"conversation_id": conversation_id, "offset": 0},
             stream=True,
+            timeout=SEARCH_TIMEOUT_SECS,
         )
         result: Dict[str, Any] = {}
+        message: Dict[str, Any] = {}
+        text = ""
         try:
             ensure_ok(response, path)
             for payload in iter_sse_payloads(response):
@@ -1902,12 +1906,33 @@ class OpenAIBackendAPI:
                     event = json.loads(payload)
                 except (TypeError, ValueError):
                     continue
-                message = self._find_search_message(event)
-                if message and self._search_message_text(message):
-                    result = self._search_result_from_message(conversation_id, message)
+                candidate = self._find_search_message(event)
+                if candidate:
+                    message = candidate
+                    text = self._search_message_text(message)
+                elif message:
+                    text = apply_text_patch(event, text)
+                    self._apply_search_message_patch(message, event)
+                if message and text:
+                    message["content"] = {"content_type": "text", "parts": [text]}
+                    candidate_result = self._search_result_from_message(conversation_id, message)
+                    if candidate_result["status"] in SEARCH_DONE_STATUS:
+                        result = candidate_result
         finally:
             response.close()
         return result
+
+    def _apply_search_message_patch(self, message: Dict[str, Any], event: Dict[str, Any]) -> None:
+        operations = event.get("v") if event.get("o") == "patch" else [event]
+        if not isinstance(operations, list):
+            return
+        for operation in operations:
+            if not isinstance(operation, dict) or operation.get("o") != "replace":
+                continue
+            if operation.get("p") == "/message/status":
+                message["status"] = operation.get("v")
+            elif operation.get("p") == "/message/end_turn":
+                message["end_turn"] = operation.get("v")
 
     def _find_search_message(self, payload: Any) -> Dict[str, Any]:
         if not isinstance(payload, (dict, list)):
