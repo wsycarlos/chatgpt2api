@@ -21,7 +21,11 @@ _EXPOSED_MODELS = [
 
 
 def list_models() -> dict[str, Any]:
-    result = OpenAIBackendAPI().list_models()
+    backend = OpenAIBackendAPI()
+    try:
+        result = backend.list_models()
+    finally:
+        backend.close()
     data = result.get("data")
     if not isinstance(data, list):
         return result
