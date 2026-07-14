@@ -10,6 +10,7 @@ from services.protocol.conversation import (
     stream_image_outputs_with_pool,
 )
 from utils.image_tokens import count_image_output_items_tokens, image_usage
+from utils.log import logger
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
@@ -21,6 +22,14 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     response_format = str(body.get("response_format") or "b64_json")
     base_url = str(body.get("base_url") or "") or None
     progress_callback = body.get("progress_callback")
+    logger.info({
+        "event": "image_generation_handler_enter",
+        "model": model,
+        "stream": bool(body.get("stream")),
+        "n": n,
+        "size": size,
+        "quality": quality,
+    })
     outputs = stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
@@ -33,8 +42,16 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         progress_callback=progress_callback,
     ))
     if body.get("stream"):
+        logger.info({"event": "image_generation_handler_stream_return", "model": model})
         return stream_image_chunks(outputs)
+    logger.info({"event": "image_generation_handler_collect_start", "model": model})
     result = collect_image_outputs(outputs)
+    logger.info({
+        "event": "image_generation_handler_collect_done",
+        "model": model,
+        "data_count": len(result.get("data") or []),
+        "has_message": bool(result.get("message")),
+    })
     result["usage"] = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
         output_tokens=count_image_output_items_tokens(result.get("data"), size, quality),

@@ -17,8 +17,7 @@ import { clearStoredAuthSession, type StoredAuthSession } from "@/store/auth";
 
 const adminNavItems = [
   { href: "/image", label: "生图" },
-  { href: "/accounts", label: "号池管理" },
-  { href: "/register", label: "注册机" },
+  { href: "/accounts", label: "账号管理" },
   { href: "/image-manager", label: "图片管理" },
   { href: "/logs", label: "日志管理" },
   { href: "/debug", label: "调试" },
@@ -73,7 +72,6 @@ export function TopNav() {
 
   useEffect(() => {
     if (!session) {
-      setThirdPartyApps(null);
       return;
     }
     let active = true;

@@ -8,7 +8,6 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 from api.support import require_admin, require_identity, resolve_image_base_url
-from services.backup_service import BackupError, backup_service
 from services.config import config
 from services.image_service import (
     compress_images,
@@ -24,19 +23,11 @@ from services.image_service import (
 from services.image_storage_service import ImageStorageError, image_storage_service
 from services.image_tags_service import delete_tag, get_all_tags, set_tags
 from services.log_service import log_service
-from services.proxy_service import proxy_settings, test_clearance, test_proxy
+from services.personal_account_service import personal_account_service
 
 
 class SettingsUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
-
-
-class ProxyTestRequest(BaseModel):
-    url: str = ""
-
-
-class ClearanceTestRequest(BaseModel):
-    target_url: str = "https://chatgpt.com"
 
 
 class ImageDeleteRequest(BaseModel):
@@ -45,17 +36,26 @@ class ImageDeleteRequest(BaseModel):
     end_date: str = ""
     all_matching: bool = False
 
+
 class ImageDownloadRequest(BaseModel):
     paths: list[str]
+
 
 class ImageTagsRequest(BaseModel):
     path: str
     tags: list[str]
 
+
 class LogDeleteRequest(BaseModel):
     ids: list[str] = []
-class BackupDeleteRequest(BaseModel):
-    key: str = ""
+
+
+def _account_stats() -> dict[str, object]:
+    accounts = personal_account_service.list_accounts()
+    return {
+        "total": len(accounts),
+        "default_id": str((accounts[0] if accounts else {}).get("id") or ""),
+    }
 
 
 def create_router(app_version: str) -> APIRouter:
@@ -137,36 +137,6 @@ def create_router(app_version: str) -> APIRouter:
         require_admin(authorization)
         return log_service.delete(body.ids)
 
-    @router.post("/api/proxy/test")
-    async def test_proxy_endpoint(body: ProxyTestRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return {"result": await run_in_threadpool(test_proxy, (body.url or "").strip())}
-
-    @router.get("/api/proxy/runtime")
-    async def get_proxy_runtime_endpoint(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return {
-            "runtime": config.get_public_proxy_runtime_settings(),
-            "status": proxy_settings.get_runtime_status(),
-        }
-
-    @router.post("/api/proxy/runtime")
-    async def save_proxy_runtime_endpoint(body: SettingsUpdateRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        try:
-            config.update({"proxy_runtime": body.model_dump(mode="python")})
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-        return {
-            "runtime": config.get_public_proxy_runtime_settings(),
-            "status": proxy_settings.get_runtime_status(),
-        }
-
-    @router.post("/api/proxy/clearance/test")
-    async def test_proxy_clearance_endpoint(body: ClearanceTestRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return {"result": await run_in_threadpool(test_clearance, body.target_url)}
-
     @router.get("/api/storage/info")
     async def get_storage_info(authorization: str | None = Header(default=None)):
         require_admin(authorization)
@@ -175,14 +145,6 @@ def create_router(app_version: str) -> APIRouter:
             "backend": storage.get_backend_info(),
             "health": storage.health_check(),
         }
-
-    @router.post("/api/backup/test")
-    async def test_backup_connection(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        try:
-            return {"result": await run_in_threadpool(backup_service.test_connection)}
-        except BackupError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
     @router.post("/api/image-storage/test")
     async def test_image_storage_endpoint(authorization: str | None = Header(default=None)):
@@ -196,63 +158,6 @@ def create_router(app_version: str) -> APIRouter:
             return {"result": await run_in_threadpool(image_storage_service.sync_all)}
         except ImageStorageError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-
-    @router.get("/api/backups")
-    async def get_backups(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        try:
-            return {
-                "items": await run_in_threadpool(backup_service.list_backups),
-                "state": backup_service.get_status(),
-                "settings": backup_service.get_settings(),
-            }
-        except BackupError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-
-    @router.post("/api/backups/run")
-    async def run_backup_endpoint(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        try:
-            return {"result": await run_in_threadpool(backup_service.run_backup)}
-        except BackupError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-
-    @router.post("/api/backups/delete")
-    async def delete_backup_endpoint(body: BackupDeleteRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        try:
-            await run_in_threadpool(backup_service.delete_backup, body.key)
-            return {"ok": True}
-        except BackupError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-
-    @router.get("/api/backups/detail")
-    async def get_backup_detail(key: str = "", authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        try:
-            return {"item": await run_in_threadpool(backup_service.get_backup_detail, key)}
-        except BackupError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-
-    @router.get("/api/backups/download")
-    async def download_backup_endpoint(key: str = "", authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        try:
-            item = await run_in_threadpool(backup_service.download_backup, key)
-        except BackupError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-        filename = str(item.get("name") or "backup.bin")
-        quoted = quote(filename)
-        headers = {
-            "Content-Disposition": f"attachment; filename*=UTF-8''{quoted}",
-            "Content-Length": str(int(item.get("size") or 0)),
-        }
-        return Response(
-            content=bytes(item.get("payload") or b""),
-            media_type=str(item.get("content_type") or "application/octet-stream"),
-            headers=headers,
-        )
-
 
     @router.get("/api/images/tags")
     async def list_image_tags(authorization: str | None = Header(default=None)):
@@ -295,18 +200,16 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.get("/health", response_model=None)
     async def health_dashboard(format: str = Query(default="html")):
-        from services.account_service import account_service as acct_svc
-        stats = acct_svc.get_stats()
+        stats = _account_stats()
         storage = config.get_storage_backend()
         storage_health = storage.health_check()
-        healthy = stats["active"] > 0 or stats["unlimited_quota_count"] > 0
+        healthy = stats["total"] > 0
 
         stats_json = {
             "status": "ok" if healthy else "degraded",
             "healthy": healthy,
             "version": app_version,
             "storage": {"backend": storage.get_backend_info(), "health": storage_health},
-            "proxy_runtime": proxy_settings.get_runtime_status(),
             "accounts": stats,
         }
         if format == "json":
@@ -314,7 +217,7 @@ def create_router(app_version: str) -> APIRouter:
         return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="zh">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>号池健康监控 - chatgpt2api</title>
+<title>服务健康监控 - chatgpt2api</title>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{font-family:system-ui,-apple-system,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}}
@@ -339,27 +242,14 @@ td{{padding:8px 12px;border-top:1px solid #2a2d3a;font-size:14px}}tr:hover td{{b
 </head>
 <body>
 <div class="header">
-<h1><span class="status-dot {'status-ok' if healthy else 'status-degraded'}"></span>号池健康监控</h1>
+<h1><span class="status-dot {'status-ok' if healthy else 'status-degraded'}"></span>服务健康监控</h1>
 <div style="font-size:13px;color:#94a3b8">v{app_version} · 30s 自动刷新</div>
 </div>
 <div class="container">
 <div class="cards">
-<div class="card"><div class="label">号池状态</div><div class="value {'green' if healthy else 'yellow'}">{'正常' if healthy else '异常'}</div></div>
-<div class="card"><div class="label">当前账号</div><div class="value blue">{stats['total']}</div></div>
-<div class="card"><div class="label">累计入库</div><div class="value">{stats['cumulative_total']}</div></div>
-<div class="card"><div class="label">可用账号</div><div class="value green">{stats['active']}</div></div>
-<div class="card"><div class="label">无限额</div><div class="value">{stats['unlimited_quota_count']}</div></div>
-<div class="card"><div class="label">剩余额度</div><div class="value">{stats['total_quota']}</div></div>
-<div class="card"><div class="label">限流</div><div class="value yellow">{stats['limited']}</div></div>
-<div class="card"><div class="label">异常</div><div class="value red">{stats['abnormal']}</div></div>
-<div class="card"><div class="label">禁用</div><div class="value">{stats['disabled']}</div></div>
-<div class="card"><div class="label">成功/失败</div><div class="value">{stats['total_success']}<span style="font-size:18px;color:#94a3b8">/</span><span class="red">{stats['total_fail']}</span></div></div>
+<div class="card"><div class="label">服务状态</div><div class="value {'green' if healthy else 'yellow'}">{'正常' if healthy else '未配置账号'}</div></div>
+<div class="card"><div class="label">已配置账号</div><div class="value blue">{stats['total']}</div></div>
 </div>
-<h2 style="margin-bottom:12px;font-size:16px">账号类型分布</h2>
-<table>
-<tr><th>类型</th><th>数量</th></tr>
-{''.join(f'<tr><td>{t}</td><td>{c}</td></tr>' for t,c in sorted(stats['by_type'].items()))}
-</table>
 <div class="refresh">JSON: <span class="api-url">/health?format=json</span></div>
 </div></body></html>""")
 

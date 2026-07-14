@@ -1,4 +1,5 @@
 import base64
+import copy
 import json
 import mimetypes
 import os
@@ -19,10 +20,10 @@ from urllib.parse import unquote, urlparse
 from curl_cffi import requests
 from PIL import Image
 
-from services.account_service import account_service
 from services.config import config
-from services.proxy_service import proxy_settings
+from services.personal_account_service import _decode_jwt_payload, personal_account_service
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
+from utils.conversation_patch import apply_text_patch
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
 from utils.turnstile import solve_turnstile_token
@@ -51,6 +52,13 @@ class ChatRequirements:
     raw_finalize: Optional[Dict[str, Any]] = None
 
 
+@dataclass
+class SearchConversationState:
+    conversation_id: str
+    resume_token: str = ""
+    handoff: bool = False
+
+
 DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
 DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
@@ -60,6 +68,7 @@ SEARCH_MODEL = "gpt-5-5"
 SEARCH_TIMEOUT_SECS = 300.0
 SEARCH_POLL_INTERVAL_SECS = 3.0
 SEARCH_DONE_STATUS = {"finished_successfully", "finished_partial_completion"}
+SEARCH_TRANSIENT_STATUS_CODES = {404, 409, 423, 429, 500, 502, 503, 504}
 SEARCH_CONVERSATION_ID_RE = re.compile(r'"conversation_id"\s*:\s*"([^"]+)"')
 SEARCH_URL_RE = re.compile(r"https?://[^\s\"'<>）)\]}]+")
 EDITABLE_FILE_MODEL = "gpt-5-5-thinking"
@@ -158,7 +167,7 @@ class OpenAIBackendAPI:
         self.client_version = DEFAULT_CLIENT_VERSION
         self.client_build_number = DEFAULT_CLIENT_BUILD_NUMBER
         self.access_token = access_token
-        self.account = account_service.get_account(self.access_token) if self.access_token else {}
+        self.account = personal_account_service.get_default_account() or {}
         self.account = self.account if isinstance(self.account, dict) else {}
         self.fp = self._build_fp()
         self.user_agent = self.fp["user-agent"]
@@ -167,11 +176,10 @@ class OpenAIBackendAPI:
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
-        self.session = requests.Session(**proxy_settings.build_session_kwargs(
-            account=self.account,
+        self.session = requests.Session(
             impersonate=self.fp["impersonate"],
             verify=True,
-        ))
+        )
         self.session.headers.update({
             "User-Agent": self.user_agent,
             "Origin": self.base_url,
@@ -513,7 +521,7 @@ class OpenAIBackendAPI:
         if not base_model:
             return "auto"
         if base_model == "gpt-image-2":
-            return "gpt-5-3"
+            return "gpt-5-5-thinking"
         if base_model == CODEX_IMAGE_MODEL:
             return base_model
         return "auto"
@@ -541,10 +549,14 @@ class OpenAIBackendAPI:
         }
 
     def _ensure_codex_source_account(self) -> None:
-        account = account_service.get_account(self.access_token)
-        source_type = str((account or {}).get("source_type") or "web").strip().lower()
-        if source_type != "codex":
-            raise RuntimeError("codex responses endpoint requires a codex source account")
+        """在个人账号模式下，任何通过 OAuth 或 Token 导入的账号都可以尝试使用 Codex 生图。
+
+        原实现要求 source_type == "codex"，但个人账号模式的 source_type 通常为
+        "oauth_login" 或 "web"，这会导致合法账号无法使用 codex-gpt-image-2。
+        Codex 接口本身会根据 token 的订阅权限返回错误，因此这里不再额外限制。
+        """
+        if not personal_account_service.get_default_account():
+            raise RuntimeError("codex responses endpoint requires a configured account")
 
     @staticmethod
     def _codex_image_input(prompt: str, images: list[str]) -> list[Dict[str, Any]]:
@@ -746,8 +758,8 @@ class OpenAIBackendAPI:
             self._codex_responses_headers(),
             method="POST",
         )
-        account = account_service.get_account(self.access_token) or {}
-        token_payload = account_service._decode_jwt_payload(self.access_token)
+        account = personal_account_service.get_default_account() or {}
+        token_payload = _decode_jwt_payload(self.access_token)
         auth_claim = token_payload.get("https://api.openai.com/auth")
         auth_claim = auth_claim if isinstance(auth_claim, dict) else {}
         tool = payload["tools"][0]
@@ -1744,8 +1756,23 @@ class OpenAIBackendAPI:
             raise RuntimeError("access_token is required for search")
         conduit_token = self._prepare_search_conversation(prompt, model)
         self._bootstrap()
-        conversation_id = self._run_search_conversation(prompt, conduit_token, model)
-        return self._wait_search_result(conversation_id, timeout_secs, poll_interval_secs)
+        state = self._run_search_conversation(prompt, conduit_token, model)
+        if state.handoff and state.resume_token:
+            if timeout_secs <= 0:
+                return self._wait_search_result(state.conversation_id, 0, poll_interval_secs)
+            deadline = time.monotonic() + timeout_secs
+            try:
+                result = self._resume_search_result(state.conversation_id, state.resume_token, timeout_secs)
+                if result.get("answer"):
+                    return result
+            except UpstreamHTTPError as exc:
+                if exc.status_code not in SEARCH_TRANSIENT_STATUS_CODES:
+                    raise
+            except requests.RequestsError:
+                pass
+            remaining = max(0, deadline - time.monotonic())
+            return self._wait_search_result(state.conversation_id, remaining, poll_interval_secs)
+        return self._wait_search_result(state.conversation_id, timeout_secs, poll_interval_secs)
 
     def _prepare_search_conversation(self, prompt: str, model: str) -> str:
         path = "/backend-api/f/conversation/prepare"
@@ -1775,7 +1802,7 @@ class OpenAIBackendAPI:
             raise RuntimeError("missing conduit_token")
         return token
 
-    def _run_search_conversation(self, prompt: str, conduit_token: str, model: str) -> str:
+    def _run_search_conversation(self, prompt: str, conduit_token: str, model: str) -> SearchConversationState:
         requirements = self._get_chat_requirements()
         path = "/backend-api/f/conversation"
         response = self.session.post(
@@ -1817,59 +1844,242 @@ class OpenAIBackendAPI:
         )
         ensure_ok(response, path)
         conversation_id = ""
+        resume_token = ""
+        handoff = False
         try:
             for payload in iter_sse_payloads(response):
-                conversation_id = conversation_id or self._find_search_value(payload, "conversation_id")
                 if payload == "[DONE]":
                     break
+                try:
+                    event = json.loads(payload)
+                except (TypeError, ValueError):
+                    event = payload
+                conversation_id = conversation_id or self._find_search_value(event, "conversation_id")
+                if isinstance(event, dict) and event.get("type") == "resume_conversation_token":
+                    resume_token = str(event.get("token") or "")
+                if isinstance(event, dict) and event.get("type") == "stream_handoff":
+                    handoff = True
         finally:
             response.close()
         if not conversation_id:
             raise RuntimeError("conversation_id not found in stream")
-        return conversation_id
+        return SearchConversationState(conversation_id, resume_token, handoff)
 
     def _wait_search_result(self, conversation_id: str, timeout_secs: float, poll_interval_secs: float) -> Dict[str, Any]:
-        deadline = time.time() + timeout_secs
+        deadline = time.monotonic() + timeout_secs
         last_result: Dict[str, Any] | None = None
+        last_nonempty_result: Dict[str, Any] | None = None
         last_answer = ""
         stable_hits = 0
-        while time.time() < deadline:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            current_result: Dict[str, Any] | None = None
             try:
-                last_result = self._extract_search_result(conversation_id, self._get_search_conversation(conversation_id))
+                current_result = self._extract_search_result(
+                    conversation_id,
+                    self._get_search_conversation(conversation_id, timeout_secs=min(60, remaining)),
+                )
+                last_result = current_result
             except UpstreamHTTPError as exc:
-                if exc.status_code not in {404, 409, 423, 429, 500, 502, 503, 504}:
+                if exc.status_code not in SEARCH_TRANSIENT_STATUS_CODES:
                     raise
-            if last_result and last_result.get("answer"):
-                if last_result.get("status") in SEARCH_DONE_STATUS:
-                    return last_result
-                answer = str(last_result.get("answer") or "")
+            if current_result and current_result.get("answer"):
+                last_nonempty_result = current_result
+                if current_result.get("status") in SEARCH_DONE_STATUS:
+                    return current_result
+                answer = str(current_result.get("answer") or "")
                 stable_hits = stable_hits + 1 if answer == last_answer else 0
                 last_answer = answer
                 if stable_hits >= 2:
-                    return last_result
-            time.sleep(poll_interval_secs)
+                    return current_result
+            else:
+                stable_hits = 0
+                last_answer = ""
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(poll_interval_secs, remaining))
+        if last_nonempty_result:
+            return last_nonempty_result
         if last_result:
             return last_result
         raise RuntimeError(f"timed out waiting for search result: {conversation_id}")
 
-    def _get_search_conversation(self, conversation_id: str) -> Dict[str, Any]:
+    def _get_search_conversation(self, conversation_id: str, timeout_secs: float = 60) -> Dict[str, Any]:
         path = f"/backend-api/conversation/{conversation_id}"
         headers = self._headers(path, {"Accept": "*/*"})
         headers["Referer"] = f"{self.base_url}/c/{conversation_id}"
         headers["X-OpenAI-Target-Route"] = "/backend-api/conversation/{conversation_id}"
-        response = self.session.get(self.base_url + path, headers=headers, timeout=60)
+        response = self.session.get(self.base_url + path, headers=headers, timeout=timeout_secs)
         ensure_ok(response, path)
         return response.json()
 
+    def _resume_search_result(self, conversation_id: str, resume_token: str,
+                              timeout_secs: float = SEARCH_TIMEOUT_SECS) -> Dict[str, Any]:
+        path = "/backend-api/f/conversation/resume"
+        response = self.session.post(
+            self.base_url + path,
+            headers=self._headers(path, {
+                "Accept": "text/event-stream",
+                "Content-Type": "application/json",
+                "X-Conduit-Token": resume_token,
+            }),
+            json={"conversation_id": conversation_id, "offset": 0},
+            stream=True,
+            timeout=timeout_secs,
+        )
+        result: Dict[str, Any] = {}
+        message: Dict[str, Any] = {}
+        text = ""
+        try:
+            ensure_ok(response, path)
+            for payload in iter_sse_payloads(response):
+                if payload == "[DONE]":
+                    break
+                try:
+                    event = json.loads(payload)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(event, dict) and event.get("type") == "stream_handoff":
+                    result = {}
+                    message = {}
+                    text = ""
+                    continue
+                candidate = self._find_search_message(event)
+                if candidate:
+                    message = copy.deepcopy(candidate)
+                    text = self._search_message_text(message)
+                elif self._has_search_message(event):
+                    message = {}
+                    text = ""
+                elif message:
+                    bare_delta = event.get("v") if isinstance(event, dict) else None
+                    if isinstance(bare_delta, str) and not event.get("p") and not event.get("o"):
+                        text += bare_delta
+                    else:
+                        text = apply_text_patch(event, text)
+                    self._apply_search_message_patch(message, event)
+                if message and text:
+                    self._set_search_message_text(message, text)
+                    result = self._search_result_from_message(conversation_id, message)
+        finally:
+            response.close()
+        return result
+
+    def _has_search_message(self, payload: Any) -> bool:
+        if isinstance(payload, dict):
+            if isinstance(payload.get("author"), dict) and "content" in payload:
+                return True
+            if isinstance(payload.get("message"), dict):
+                return True
+            return any(self._has_search_message(value) for value in payload.values())
+        if isinstance(payload, list):
+            return any(self._has_search_message(value) for value in payload)
+        return False
+
+    @staticmethod
+    def _set_search_message_text(message: Dict[str, Any], text: str) -> None:
+        content = message.get("content")
+        if not isinstance(content, dict):
+            message["content"] = {"content_type": "text", "parts": [text]}
+            return
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            content["parts"] = [text]
+        elif parts:
+            parts[0] = text
+        else:
+            parts.append(text)
+
+    def _apply_search_message_patch(self, message: Dict[str, Any], event: Dict[str, Any]) -> None:
+        operations = event.get("v") if event.get("o") == "patch" else [event]
+        if not isinstance(operations, list):
+            return
+        for operation in operations:
+            if not isinstance(operation, dict) or operation.get("o") != "replace":
+                continue
+            if operation.get("p") == "/message/status":
+                message["status"] = operation.get("v")
+            elif operation.get("p") == "/message/end_turn":
+                message["end_turn"] = operation.get("v")
+
+    def _find_search_message(self, payload: Any) -> Dict[str, Any]:
+        if not isinstance(payload, (dict, list)):
+            return {}
+        candidates: list[Any] = []
+        if isinstance(payload, dict):
+            candidates.extend((payload, payload.get("message")))
+            nested = [value for key, value in payload.items() if key != "message"]
+        else:
+            nested = payload
+        for candidate in candidates:
+            if self._is_final_search_message(candidate):
+                return candidate
+        for value in nested:
+            message = self._find_search_message(value)
+            if message:
+                return message
+        return {}
+
+    @staticmethod
+    def _is_final_search_message(message: Any, allow_missing_channel: bool = False) -> bool:
+        if not isinstance(message, dict):
+            return False
+        author = message.get("author")
+        if not isinstance(author, dict) or str(author.get("role") or "") != "assistant":
+            return False
+        raw_metadata = message.get("metadata")
+        metadata: Dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
+        channel = str(message.get("channel") or metadata.get("channel") or "").lower()
+        if channel != "final" and (channel or not allow_missing_channel):
+            return False
+        raw_content = message.get("content")
+        content: Dict[str, Any] = raw_content if isinstance(raw_content, dict) else {}
+        content_type = str(content.get("content_type") or "").lower()
+        return "thought" not in content_type and "reasoning" not in content_type
+
     def _extract_search_result(self, conversation_id: str, conversation: Dict[str, Any]) -> Dict[str, Any]:
-        messages = []
-        for node in (conversation.get("mapping") or {}).values():
-            message = (node or {}).get("message") or {}
-            if ((message.get("author") or {}).get("role") or "") == "assistant":
-                messages.append(message)
-        message = max(messages, key=lambda item: float(item.get("create_time") or 0.0)) if messages else {}
-        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
-        finish_details = metadata.get("finish_details") if isinstance(metadata.get("finish_details"), dict) else {}
+        final_messages: list[Dict[str, Any]] = []
+        legacy_messages: list[Dict[str, Any]] = []
+        mapping = conversation.get("mapping")
+        if not isinstance(mapping, dict):
+            mapping = {}
+        current_node = conversation.get("current_node")
+        nodes: list[Any] = []
+        if isinstance(current_node, str) and isinstance(mapping.get(current_node), dict):
+            node_id: Any = current_node
+            visited: set[str] = set()
+            while isinstance(node_id, str) and node_id not in visited:
+                node = mapping.get(node_id)
+                if not isinstance(node, dict):
+                    break
+                visited.add(node_id)
+                nodes.append(node)
+                node_id = node.get("parent")
+        else:
+            nodes = list(mapping.values())
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            message = node.get("message")
+            if isinstance(message, dict) and self._is_final_search_message(message, allow_missing_channel=True):
+                raw_metadata = message.get("metadata")
+                metadata: Dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
+                channel = str(message.get("channel") or metadata.get("channel") or "").lower()
+                (final_messages if channel == "final" else legacy_messages).append(message)
+        messages = final_messages or legacy_messages
+        nonempty_messages = [item for item in messages if self._search_message_text(item)]
+        selectable_messages = nonempty_messages or messages
+        message = max(selectable_messages, key=lambda item: float(item.get("create_time") or 0.0)) if selectable_messages else {}
+        return self._search_result_from_message(conversation_id, message)
+
+    def _search_result_from_message(self, conversation_id: str, message: Dict[str, Any]) -> Dict[str, Any]:
+        raw_metadata = message.get("metadata")
+        metadata: Dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
+        raw_finish_details = metadata.get("finish_details")
+        finish_details: Dict[str, Any] = raw_finish_details if isinstance(raw_finish_details, dict) else {}
         answer = self._search_message_text(message)
         sources = self._extract_search_sources(message)
         for url in SEARCH_URL_RE.findall(answer):
@@ -1888,7 +2098,8 @@ class OpenAIBackendAPI:
     def _extract_search_sources(self, payload: Any) -> list[Dict[str, str]]:
         sources: list[Dict[str, str]] = []
         for obj in self._walk_search_dicts(payload):
-            metadata = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
+            raw_metadata = obj.get("metadata")
+            metadata: Dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
             url = self._clean_search_url(obj.get("url") or obj.get("link") or obj.get("source_url") or metadata.get("url"))
             if url and all(item["url"] != url for item in sources):
                 sources.append({

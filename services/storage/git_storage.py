@@ -119,7 +119,7 @@ class GitStorageBackend(StorageBackend):
             print(f"[git-storage] save failed: {e}")
             raise e
 
-    def load_personal_accounts(self) -> list[dict[str, object]]:
+    def load_personal_accounts(self) -> list[dict[str, Any]]:
         """从 Git 仓库加载个人账号数据"""
         try:
             return self._load_json_file(self.personal_accounts_file_path)
@@ -127,7 +127,7 @@ class GitStorageBackend(StorageBackend):
             print(f"[git-storage] load failed: {e}")
             raise
 
-    def save_personal_accounts(self, accounts: list[dict[str, object]]) -> None:
+    def save_personal_accounts(self, accounts: list[dict[str, Any]]) -> None:
         """保存个人账号数据到 Git 仓库"""
         try:
             self._save_json_file(self.personal_accounts_file_path, accounts, "Update personal accounts data")

@@ -10,10 +10,10 @@ from typing import Any, Iterable, Iterator
 
 import tiktoken
 
-from services.account_service import account_service
 from services.config import config
 from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
+from services.personal_account_service import personal_account_service
 from utils.helper import (
     IMAGE_MODELS,
     extract_image_from_message_content,
@@ -21,6 +21,7 @@ from utils.helper import (
     is_supported_image_model,
     split_image_model,
 )
+from utils.conversation_patch import apply_patch_op as apply_patch_op, apply_text_patch, strip_history
 from utils.image_tokens import count_image_content_tokens
 from utils.log import logger
 
@@ -378,14 +379,6 @@ def assistant_message_text(message: dict[str, Any]) -> str:
     return ""
 
 
-def strip_history(text: str, history_text: str = "") -> str:
-    text = str(text or "")
-    history_text = str(history_text or "")
-    while history_text and text.startswith(history_text):
-        text = text[len(history_text):]
-    return text
-
-
 def sanitize_output_text(text: str) -> str:
     text = str(text or "")
 
@@ -459,41 +452,6 @@ def event_assistant_text(event: dict[str, Any], history_text: str = "") -> str:
         if isinstance(message, dict) and (message.get("author") or {}).get("role") == "assistant":
             return strip_history(assistant_message_text(message), history_text)
     return ""
-
-
-def apply_text_patch(event: dict[str, Any], current_text: str = "", history_text: str = "") -> str:
-    if event.get("p") == "/message/content/parts/0":
-        return apply_patch_op(event, current_text, history_text)
-
-    operations = event.get("v")
-    if isinstance(operations, str) and current_text and not event.get("p") and not event.get("o"):
-        return current_text + operations
-
-    if event.get("o") == "patch" and isinstance(operations, list):
-        text = current_text
-        for item in operations:
-            if isinstance(item, dict):
-                text = apply_text_patch(item, text, history_text)
-        return text
-
-    if not isinstance(operations, list):
-        return current_text
-
-    text = current_text
-    for item in operations:
-        if isinstance(item, dict):
-            text = apply_text_patch(item, text, history_text)
-    return text
-
-
-def apply_patch_op(operation: dict[str, Any], current_text: str, history_text: str = "") -> str:
-    op = operation.get("o")
-    value = str(operation.get("v") or "")
-    if op == "append":
-        return current_text + value
-    if op == "replace":
-        return strip_history(value, history_text)
-    return current_text
 
 
 def add_unique(values: list[str], candidates: list[str]) -> None:
@@ -672,18 +630,16 @@ def conversation_events(
 
 
 def text_backend() -> OpenAIBackendAPI:
-    return OpenAIBackendAPI(access_token=account_service.get_text_access_token())
+    return OpenAIBackendAPI(access_token=personal_account_service.get_active_access_token())
 
 
 def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[str]:
-    attempted_tokens: set[str] = set()
-    token = getattr(backend, "access_token", "")
+    account = personal_account_service.get_default_account()
+    if account is None:
+        raise RuntimeError("No ChatGPT account configured")
+    token = account["access_token"]
     emitted = False
     while True:
-        if token and token in attempted_tokens:
-            raise RuntimeError("no available text account")
-        if token:
-            attempted_tokens.add(token)
         try:
             active_backend = OpenAIBackendAPI(access_token=token)
             for event in conversation_events(active_backend, messages=request.messages, model=request.model, prompt=request.prompt):
@@ -693,18 +649,14 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                 if delta:
                     emitted = True
                     yield delta
-            account_service.mark_text_used(token)
             return
         except Exception as exc:
             error_message = str(exc)
-            if token and not emitted and is_token_invalid_error(error_message):
-                refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
-                if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:
-                    token = refreshed_token
-                else:
-                    account_service.remove_invalid_token(token, "text_stream")
-                    token = account_service.get_text_access_token(attempted_tokens)
-                if token:
+            if not emitted and is_token_invalid_error(error_message):
+                refreshed = personal_account_service.refresh_access_token(account["id"])
+                if refreshed:
+                    token = refreshed["access_token"]
+                    account = refreshed
                     continue
             raise
 
@@ -1217,58 +1169,73 @@ def _generate_single_image(
         index: int,
         total: int,
 ) -> list[ImageOutput]:
-    """为单张图片执行生成逻辑（含重试），返回结果列表。
-
-    该函数在独立线程中运行，每个线程使用不同的账号，
-    实现并行生图，避免串行超时阻塞。
-    """
-    # 模型返回文本而非图片的最大重试次数
+    """为单张图片执行生成逻辑（含重试），返回结果列表。"""
     MAX_TEXT_REPLY_RETRIES = 3
-    # TLS 连接错误最大重试次数
     MAX_TLS_RETRIES = 3
-    # 连接超时错误最大重试次数（同账号短等待重试）
     MAX_CONN_TIMEOUT_RETRIES = 3
-    # 轮询超时错误最大重试次数（换账号重试）
     MAX_POLL_TIMEOUT_RETRIES = 4
 
     text_reply_retry_count = 0
     tls_retry_count = 0
     conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
-    account_email = ""
+
+    account = personal_account_service.get_default_account()
+    if account is None:
+        raise ImageGenerationError("No ChatGPT account configured")
+    first_account_id = str(account.get("id") or "")
+    tried_account_ids: set[str] = set()
+    account_email = str(account.get("email") or "").strip()
+    token = account["access_token"]
+
+    def failover_to_next_account(error_text: str) -> bool:
+        nonlocal account, account_email, token
+        if account is None:
+            return False
+        next_account = personal_account_service.switch_active_account(str(account.get("id") or ""))
+        if next_account is None:
+            if first_account_id:
+                personal_account_service.restore_active_account(first_account_id)
+            return False
+        next_account_id = str(next_account.get("id") or "")
+        if next_account_id not in tried_account_ids:
+            logger.warning({
+                "event": "image_stream_account_failover",
+                "failed_account_email": account_email,
+                "next_account_email": str(next_account.get("email") or "").strip(),
+                "index": index,
+                "error": error_text[:200],
+            })
+            account = next_account
+            account_email = str(account.get("email") or "").strip()
+            token = account["access_token"]
+            return True
+        if first_account_id:
+            personal_account_service.restore_active_account(first_account_id)
+        return False
 
     while True:
-        try:
-            if request.progress_callback:
-                request.progress_callback("getting_account")
-            plan_type, _ = split_image_model(request.model)
-            codex_model = is_codex_image_model(request.model)
-            token = account_service.get_available_access_token(
-                plan_type=plan_type,
-                source_type="codex" if codex_model else None,
-                plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
-            )
-        except RuntimeError as exc:
-            raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
-
+        if request.progress_callback:
+            request.progress_callback("getting_account")
         emitted_for_token = False
-        returned_message = False
-        returned_result = False
-        account = account_service.get_account(token) or {}
-        account_email = str(account.get("email") or "").strip()
         logger.debug({
             "event": "image_account_lookup",
             "token_prefix": token[:12] + "..." if len(token) > 12 else token,
             "account_email": account_email,
-            "account_found": bool(account),
+            "account_found": True,
             "index": index,
         })
         try:
+            account_id = str(account.get("id") or "")
+            if account_id:
+                tried_account_ids.add(account_id)
             backend = OpenAIBackendAPI(access_token=token)
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
             outputs: list[ImageOutput] = []
+            returned_message = False
+            returned_result = False
             for output in stream_fn(backend, request, index, total):
                 if account_email and not output.account_email:
                     output.account_email = account_email
@@ -1286,10 +1253,8 @@ def _generate_single_image(
                 returned_result = returned_result or output.kind == "result"
                 outputs.append(output)
             if returned_message:
-                account_service.mark_image_result(token, False)
                 return outputs
             if not returned_result:
-                account_service.mark_image_result(token, False)
                 if emitted_for_token:
                     conv_id = outputs[-1].conversation_id if outputs else ""
                     raise ImageGenerationError(
@@ -1300,14 +1265,13 @@ def _generate_single_image(
                         account_email=account_email,
                         conversation_id=conv_id,
                     )
+                if failover_to_next_account("upstream returned no image output"):
+                    continue
                 return outputs
-            account_service.mark_image_result(token, True)
             return outputs
         except ImagePollTimeoutError as exc:
-            account_service.mark_image_result(token, False)
             if account_email:
                 setattr(exc, "account_email", account_email)
-            # 轮询超时：换账号重试
             if not emitted_for_token:
                 poll_timeout_retry_count += 1
                 if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
@@ -1327,10 +1291,12 @@ def _generate_single_image(
                     "retry_count": poll_timeout_retry_count,
                     "index": index,
                 })
-                raise
+            if failover_to_next_account(str(exc)):
+                continue
             raise
         except ImageContentPolicyError as exc:
-            account_service.mark_image_result(token, False)
+            if failover_to_next_account(str(exc)):
+                continue
             logger.warning({
                 "event": "image_stream_content_policy_error",
                 "request_token": token,
@@ -1347,11 +1313,9 @@ def _generate_single_image(
                 conversation_id=getattr(exc, "conversation_id", ""),
             ) from exc
         except ImageGenerationError as exc:
-            account_service.mark_image_result(token, False)
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
             error_text = str(exc)
-            # 如果是模型返回文本而非图片，尝试换账号重试
             if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token:
                 text_reply_retry_count += 1
                 if text_reply_retry_count <= MAX_TEXT_REPLY_RETRIES:
@@ -1380,6 +1344,8 @@ def _generate_single_image(
                     account_email=account_email,
                     conversation_id=getattr(exc, "conversation_id", ""),
                 ) from exc
+            if failover_to_next_account(error_text):
+                continue
             logger.warning({
                 "event": "image_stream_generation_error",
                 "request_token": token,
@@ -1389,7 +1355,6 @@ def _generate_single_image(
             })
             raise
         except Exception as exc:
-            account_service.mark_image_result(token, False)
             last_error = str(exc)
             logger.warning({
                 "event": "image_stream_fail",
@@ -1399,13 +1364,14 @@ def _generate_single_image(
                 "index": index,
             })
             if not emitted_for_token and is_token_invalid_error(last_error):
-                refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
-                if refreshed_token and refreshed_token != token:
-                    token = refreshed_token
+                refreshed = personal_account_service.refresh_access_token(account["id"])
+                if refreshed and str(refreshed.get("access_token") or "") != token:
+                    token = refreshed["access_token"]
+                    account = refreshed
                     continue
-                account_service.remove_invalid_token(token, "image_stream")
-                continue
-            # TLS/SSL 连接错误：自动重试
+                if failover_to_next_account(last_error):
+                    continue
+                raise ImageGenerationError("ChatGPT token invalid", account_email=account_email, conversation_id="") from exc
             if not emitted_for_token and is_tls_connection_error(last_error):
                 tls_retry_count += 1
                 if tls_retry_count <= MAX_TLS_RETRIES:
@@ -1419,7 +1385,6 @@ def _generate_single_image(
                     })
                     time.sleep(min(2.0 * tls_retry_count, 10.0))
                     continue
-            # 连接超时错误（curl 28）：同账号短等待重试，不切换账号
             if not emitted_for_token and is_connection_timeout_error(last_error):
                 conn_timeout_retry_count += 1
                 if conn_timeout_retry_count <= MAX_CONN_TIMEOUT_RETRIES:
@@ -1435,7 +1400,10 @@ def _generate_single_image(
                     })
                     time.sleep(wait_secs)
                     continue
+            if failover_to_next_account(last_error):
+                continue
             raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
+
 
 
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:

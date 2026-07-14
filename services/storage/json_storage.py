@@ -64,11 +64,11 @@ class JSONStorageBackend(StorageBackend):
             encoding="utf-8",
         )
 
-    def load_personal_accounts(self) -> list[dict[str, object]]:
+    def load_personal_accounts(self) -> list[dict[str, Any]]:
         """从 JSON 文件加载个人账号数据"""
         return self._load_json_list(self.personal_accounts_path)
 
-    def save_personal_accounts(self, accounts: list[dict[str, object]]) -> None:
+    def save_personal_accounts(self, accounts: list[dict[str, Any]]) -> None:
         """保存个人账号数据到 JSON 文件"""
         self._save_json_list(self.personal_accounts_path, accounts)
 
